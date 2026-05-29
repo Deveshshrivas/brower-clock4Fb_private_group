@@ -1,0 +1,24 @@
+{
+  "group": {
+    "url": "https://www.facebook.com/groups/964040666405959",
+    "member_count_text": "2 members"
+  },
+  "posts": [
+    {
+      "id": "ad2e61dc0678924b",
+      "author": "Devesh Sen",
+      "posted_at": null,
+      "url": null,
+      "text": "Testing new update",
+      "raw_text": "Devesh Sen\n·\n5\n9\n1\n0\n6\n2\n4\n:\n8\n7\nTesting new update",
+      "text_parts": [
+        "Devesh Sen",
+        "Testing new update"
+      ],
+      "reactions_text": null,
+      "comment_count_text": null,
+      "share_count_text": null,
+      "comments": []
+    }
+  ]
+}

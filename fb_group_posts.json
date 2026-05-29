@@ -1,0 +1,128 @@
+{
+  "group": {
+    "url": "https://www.facebook.com/groups/964040666405959",
+    "member_count_text": "2 members"
+  },
+  "posts": [
+    {
+      "id": "981bbd9f2bfb6f40",
+      "author": "Dev Sen",
+      "posted_at": "1w",
+      "url": "https://www.facebook.com/groups/964040666405959/posts/964040713072621/",
+      "text": "testing dev",
+      "raw_text": "Dev Sentesting dev1w",
+      "text_parts": [
+        "Dev Sen",
+        "testing dev",
+        "1w"
+      ],
+      "reactions_text": null,
+      "comment_count_text": null,
+      "share_count_text": null,
+      "comments": [
+        {
+          "author": "Dev Sen",
+          "posted_at": "1w",
+          "text": "Dev Sentesting dev1w",
+          "reactions": null
+        }
+      ]
+    },
+    {
+      "id": "ad2e61dc0678924b",
+      "author": "Devesh Sen",
+      "posted_at": null,
+      "url": null,
+      "text": "Testing new update",
+      "raw_text": "Devesh Sen\n·\n6\n1\n9\n8\n7\n3\n2\n:\n0\n4\nTesting new update",
+      "text_parts": [
+        "Devesh Sen",
+        "Testing new update"
+      ],
+      "reactions_text": null,
+      "comment_count_text": null,
+      "share_count_text": null,
+      "comments": []
+    },
+    {
+      "id": "cfb2533ff30abcd1",
+      "author": "Dev Sen",
+      "posted_at": null,
+      "url": null,
+      "text": "hello",
+      "raw_text": "Dev Sen\n·\nhello",
+      "text_parts": [
+        "Dev Sen",
+        "hello"
+      ],
+      "reactions_text": null,
+      "comment_count_text": null,
+      "share_count_text": null,
+      "comments": []
+    },
+    {
+      "id": "75252306d0448134",
+      "author": "Dev Sen",
+      "posted_at": null,
+      "url": null,
+      "text": "testing",
+      "raw_text": "Dev Sen\n·\ntesting",
+      "text_parts": [
+        "Dev Sen",
+        "testing"
+      ],
+      "reactions_text": null,
+      "comment_count_text": null,
+      "share_count_text": null,
+      "comments": []
+    },
+    {
+      "id": "02b7dda67ee4c220",
+      "author": "Dev Sen",
+      "posted_at": null,
+      "url": null,
+      "text": "hello",
+      "raw_text": "Dev Sen\n·\nhello",
+      "text_parts": [
+        "Dev Sen",
+        "hello"
+      ],
+      "reactions_text": null,
+      "comment_count_text": null,
+      "share_count_text": null,
+      "comments": []
+    },
+    {
+      "id": "cab2c08429f7c4b7",
+      "author": "Dev Sen",
+      "posted_at": null,
+      "url": null,
+      "text": "testing",
+      "raw_text": "Dev Sen\n·\ntesting",
+      "text_parts": [
+        "Dev Sen",
+        "testing"
+      ],
+      "reactions_text": null,
+      "comment_count_text": null,
+      "share_count_text": null,
+      "comments": []
+    },
+    {
+      "id": "f3bfd58164eed154",
+      "author": "Dev Sen",
+      "posted_at": null,
+      "url": null,
+      "text": "testingpost",
+      "raw_text": "Dev Sen\n·\ntestingpost",
+      "text_parts": [
+        "Dev Sen",
+        "testingpost"
+      ],
+      "reactions_text": null,
+      "comment_count_text": null,
+      "share_count_text": null,
+      "comments": []
+    }
+  ]
+}
