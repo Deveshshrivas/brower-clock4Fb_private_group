@@ -1,0 +1,227 @@
+{
+  "info": {
+    "_postman_id": "9b01d99a-b403-41f2-b60a-f2a57ec55422",
+    "name": "Facebook Group Browser API",
+    "description": "Postman collection for testing the hosted Facebook Group Browser API. Use an SSH tunnel to localhost:8000 if the VPS public port is not open.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Health",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/health",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "health"
+          ]
+        }
+      }
+    },
+    {
+      "name": "OpenAPI JSON",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/openapi.json",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "openapi.json"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Start Scrape",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "const data = pm.response.json();",
+              "if (data.job_id) {",
+              "  pm.collectionVariables.set('job_id', data.job_id);",
+              "}"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"group_url\": \"{{group_url}}\",\n  \"max_posts\": 1,\n  \"max_comments\": 0,\n  \"scrolls\": 1,\n  \"comment_expand_rounds\": 0,\n  \"headless\": true\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/scrape",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Scrape And Return JSON",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"group_url\": \"{{group_url}}\",\n  \"max_posts\": {{max_posts}},\n  \"max_comments\": {{max_comments}},\n  \"scrolls\": {{scrolls}},\n  \"comment_expand_rounds\": {{comment_expand_rounds}},\n  \"headless\": {{headless}}\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/scrape-json",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "scrape-json"
+          ]
+        }
+      }
+    },
+    {
+      "name": "List Jobs",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/jobs",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "jobs"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Get Job Status",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/jobs/{{job_id}}",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "jobs",
+            "{{job_id}}"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Get Result JSON",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/jobs/{{job_id}}/result",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "jobs",
+            "{{job_id}}",
+            "result"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Download Posts CSV",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/jobs/{{job_id}}/posts.csv",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "jobs",
+            "{{job_id}}",
+            "posts.csv"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Download Comments CSV",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/jobs/{{job_id}}/comments.csv",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "jobs",
+            "{{job_id}}",
+            "comments.csv"
+          ]
+        }
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8000"
+    },
+    {
+      "key": "group_url",
+      "value": "https://www.facebook.com/groups/964040666405959"
+    },
+    {
+      "key": "max_posts",
+      "value": "1"
+    },
+    {
+      "key": "max_comments",
+      "value": "0"
+    },
+    {
+      "key": "scrolls",
+      "value": "1"
+    },
+    {
+      "key": "comment_expand_rounds",
+      "value": "0"
+    },
+    {
+      "key": "headless",
+      "value": "true"
+    },
+    {
+      "key": "job_id",
+      "value": ""
+    }
+  ]
+}

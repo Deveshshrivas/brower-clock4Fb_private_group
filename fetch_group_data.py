@@ -128,8 +128,18 @@ COMMENT_CLEANUP_SCRIPT = """
 
   const rawText = clean(clone.innerText);
   let text = cleanupText(rawText, author, postedAt);
+  const images = Array.from(root.querySelectorAll('img'))
+    .map((img) => ({
+      src: img.currentSrc || img.src || null,
+      alt: clean(img.getAttribute("alt") || ""),
+      width: Number(img.getAttribute("width") || img.naturalWidth || 0) || null,
+      height: Number(img.getAttribute("height") || img.naturalHeight || 0) || null,
+      perfLogName: img.getAttribute("data-imgperflogname") || null
+    }))
+    .filter((img) => img.src && !img.src.startsWith("data:image/svg"))
+    .filter((img) => img.alt || /fbcdn|scontent/i.test(img.src || ""));
 
-  return { author, postedAt, reactionsText, text, rawText, ariaLabel };
+  return { author, postedAt, reactionsText, text, rawText, ariaLabel, images };
 }
 """
 
@@ -149,6 +159,26 @@ TEXT_PARTS_SCRIPT = """
     parts.push(value);
   }
   return [...new Set(parts)];
+}
+"""
+
+IMAGE_DETAILS_SCRIPT = """
+(root) => {
+  const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
+  const images = Array.from(root.querySelectorAll('img'))
+    .map((img) => ({
+      src: img.currentSrc || img.src || null,
+      alt: clean(img.getAttribute("alt") || ""),
+      width: Number(img.getAttribute("width") || img.naturalWidth || 0) || null,
+      height: Number(img.getAttribute("height") || img.naturalHeight || 0) || null,
+      perfLogName: img.getAttribute("data-imgperflogname") || null
+    }))
+    .filter((img) => img.src && !img.src.startsWith("data:image/svg"))
+    .filter((img) => img.alt || /fbcdn|scontent/i.test(img.src || ""));
+  return images.filter((img, index, arr) => {
+    const key = `${img.src}|${img.alt}`;
+    return arr.findIndex((other) => `${other.src}|${other.alt}` === key) === index;
+  });
 }
 """
 
@@ -175,12 +205,27 @@ FEED_CARD_SCRIPT = """
     const href = node.href || "";
     return href.includes("/posts/") || href.includes("/permalink/") || href.includes("story_fbid");
   });
+  const reactionFromAria = Array.from(root.querySelectorAll('[aria-label]'))
+    .map((node) => clean(node.getAttribute("aria-label")))
+    .find((value) => /^(?:Like|Love|Care|Haha|Wow|Sad|Angry):\\s*[\\d,.]+\\s+people?/i.test(value));
+  const images = Array.from(root.querySelectorAll('img'))
+    .map((img) => ({
+      src: img.currentSrc || img.src || null,
+      alt: clean(img.getAttribute("alt") || ""),
+      width: Number(img.getAttribute("width") || img.naturalWidth || 0) || null,
+      height: Number(img.getAttribute("height") || img.naturalHeight || 0) || null,
+      perfLogName: img.getAttribute("data-imgperflogname") || null
+    }))
+    .filter((img) => img.src && !img.src.startsWith("data:image/svg"))
+    .filter((img) => img.alt || /fbcdn|scontent/i.test(img.src || ""));
   return {
     author,
     postedAt,
     url: urlNode ? urlNode.href : null,
     parts: unique,
-    rawText: unique.join("\\n")
+    rawText: unique.join("\\n"),
+    reactionsText: reactionFromAria,
+    images
   };
 }
 """
@@ -282,6 +327,16 @@ FEED_CARDS_FROM_PAGE_SCRIPT = """
     });
 
     const text = parts.join(" ").trim();
+    const images = Array.from(article.querySelectorAll('img'))
+      .map((img) => ({
+        src: img.currentSrc || img.src || null,
+        alt: clean(img.getAttribute("alt") || ""),
+        width: Number(img.getAttribute("width") || img.naturalWidth || 0) || null,
+        height: Number(img.getAttribute("height") || img.naturalHeight || 0) || null,
+        perfLogName: img.getAttribute("data-imgperflogname") || null
+      }))
+      .filter((img) => img.src && !img.src.startsWith("data:image/svg"))
+      .filter((img) => img.alt || /fbcdn|scontent/i.test(img.src || ""));
 
     const reactionNode = Array.from(article.querySelectorAll('[aria-label], span, div')).find((node) => {
       const value = clean(node.getAttribute("aria-label") || node.innerText || node.textContent || "");
@@ -295,6 +350,7 @@ FEED_CARDS_FROM_PAGE_SCRIPT = """
       text,
       url: commentUrlNode ? commentUrlNode.href : null,
       reactionsText: reactionNode ? clean(reactionNode.getAttribute("aria-label") || reactionNode.innerText || reactionNode.textContent) : null,
+      images,
       rawText: textParts(article).join("\\n"),
       ariaLabel
     };
@@ -305,15 +361,47 @@ FEED_CARDS_FROM_PAGE_SCRIPT = """
     if (!target) return null;
 
     let node = target;
-    for (let depth = 0; depth < 6 && node && node.parentElement; depth += 1) {
-      node = node.parentElement;
+    for (let depth = 0; depth < 7 && node; depth += 1) {
       const parts = textParts(node);
-      const numberOnly = parts.find((part) => /^\\d+$/.test(part));
-      const labelled = parts.find((part) => new RegExp(`^\\\\d+\\\\s+${label}s?$`, "i").test(part));
+      const numberOnly = parts.find((part) => /^[\\d,.]+$/.test(part));
+      const labelled = parts.find((part) => new RegExp(`^\\\\d+(?:[,.]\\\\d+)*(?:\\\\.\\\\d+)?\\\\s+${label}s?$`, "i").test(part));
       if (labelled) return labelled;
       if (numberOnly) return `${numberOnly} ${label}${numberOnly === "1" ? "" : "s"}`;
+      node = node.parentElement;
     }
     return null;
+  };
+
+  const countFromText = (value) => {
+    const match = clean(value).replace(/,/g, "").match(/(\\d+(?:\\.\\d+)?)/);
+    return match ? Number(match[1]) : null;
+  };
+
+  const betterCountText = (current, candidate) => {
+    const currentCount = countFromText(current);
+    const candidateCount = countFromText(candidate);
+    if (candidateCount === null) return current;
+    if (currentCount === null || candidateCount > currentCount) return candidate;
+    return current;
+  };
+
+  const extractReactionText = (root, rawParts) => {
+    const labelled =
+      rawParts.find((part) => /^All reactions:/i.test(part)) ||
+      rawParts.find((part) => /^\\d+\\s*(?:like|likes|reaction|reactions)$/i.test(part));
+    if (labelled) return labelled;
+
+    const ariaLabel = Array.from(root.querySelectorAll('[aria-label]'))
+      .map((node) => clean(node.getAttribute("aria-label")))
+      .filter((value) => /^(?:Like|Love|Care|Haha|Wow|Sad|Angry):\\s*[\\d,.]+\\s+people?/i.test(value))
+      .sort((a, b) => {
+        const count = (value) => Number((value.match(/[\\d,.]+/) || ["0"])[0].replace(/,/g, ""));
+        return count(b) - count(a);
+      })[0];
+    return betterCountText(
+      extractCounterNear(root, '[data-ad-rendering-role="like_button"], [aria-label="Like"], [aria-label="React"]', "reaction"),
+      ariaLabel
+    );
   };
 
   const cards = [];
@@ -367,10 +455,7 @@ FEED_CARDS_FROM_PAGE_SCRIPT = """
       });
 
     const rawParts = textParts(card);
-    const reactionText =
-      rawParts.find((part) => /^All reactions:/i.test(part)) ||
-      rawParts.find((part) => /^\\d+\\s*(?:like|likes|reaction|reactions)$/i.test(part)) ||
-      null;
+    const reactionText = extractReactionText(card, rawParts);
 
     const commentCountText =
       rawParts.find((part) => /^\\d+\\s+comments?$/i.test(part)) ||
@@ -381,6 +466,16 @@ FEED_CARDS_FROM_PAGE_SCRIPT = """
       extractCounterNear(card, '[data-ad-rendering-role="share_button"], [aria-label="Share"]', "share");
 
     const parts = [author, postedAt, ...storyTexts].filter(Boolean);
+    const images = Array.from(card.querySelectorAll('img'))
+      .map((img) => ({
+        src: img.currentSrc || img.src || null,
+        alt: clean(img.getAttribute("alt") || ""),
+        width: Number(img.getAttribute("width") || img.naturalWidth || 0) || null,
+        height: Number(img.getAttribute("height") || img.naturalHeight || 0) || null,
+        perfLogName: img.getAttribute("data-imgperflogname") || null
+      }))
+      .filter((img) => img.src && !img.src.startsWith("data:image/svg"))
+      .filter((img) => img.alt || /fbcdn|scontent/i.test(img.src || ""));
 
     cards.push({
       author,
@@ -393,12 +488,64 @@ FEED_CARDS_FROM_PAGE_SCRIPT = """
       commentCountText,
       shareCountText,
       comments,
+      images,
       top: rect.top,
       left: rect.left
     });
   }
 
   return cards.sort((a, b) => a.top - b.top || a.left - b.left);
+}
+"""
+
+OPEN_ALL_COMMENTS_SORT_SCRIPT = """
+() => {
+  const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
+  const visible = (node) => {
+    const rect = node.getBoundingClientRect();
+    const style = window.getComputedStyle(node);
+    return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+  };
+  const labels = ["Most relevant", "Newest", "All comments"];
+  const matchingLabel = (text) => labels.find((label) => text === label || text.startsWith(`${label} `));
+  const candidates = Array.from(document.querySelectorAll('span, div, [role="button"]'))
+    .filter((node) => matchingLabel(clean(node.textContent)))
+    .filter(visible)
+    .filter((node) => {
+      const rect = node.getBoundingClientRect();
+      return rect.width < 600 && rect.height < 120;
+    });
+  const trigger = candidates[candidates.length - 1];
+  if (!trigger) return "not_found";
+  const current = matchingLabel(clean(trigger.textContent));
+  if (/^All comments$/i.test(current)) return "already_all_comments";
+  trigger.click();
+  return `opened_${current}`;
+}
+"""
+
+SELECT_ALL_COMMENTS_SORT_SCRIPT = """
+() => {
+  const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
+  const visible = (node) => {
+    const rect = node.getBoundingClientRect();
+    const style = window.getComputedStyle(node);
+    return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+  };
+  const candidates = Array.from(document.querySelectorAll('span, div, [role="menuitem"], [role="option"]'))
+    .filter((node) => {
+      const text = clean(node.textContent);
+      return /^All comments$/i.test(text) || /^All comments\\s+/i.test(text);
+    })
+    .filter(visible)
+    .filter((node) => {
+      const rect = node.getBoundingClientRect();
+      return rect.width < 700 && rect.height < 180;
+    });
+  const option = candidates[candidates.length - 1];
+  if (!option) return false;
+  option.click();
+  return true;
 }
 """
 
@@ -417,6 +564,7 @@ class Post:
     comment_count_text: str | None = None
     share_count_text: str | None = None
     comments: list[dict[str, str | None]] = field(default_factory=list)
+    images: list[dict[str, object]] = field(default_factory=list)
 
 
 @dataclass
@@ -484,12 +632,13 @@ def parse_args() -> argparse.Namespace:
         "--max-comments",
         type=int,
         default=int(os.getenv("MAX_COMMENTS_PER_POST", "100")),
+        help="Maximum comments/replies per post. Use 0 for no scraper-side limit.",
     )
     parser.add_argument(
         "--comment-expand-rounds",
         type=int,
         default=int(os.getenv("COMMENT_EXPAND_ROUNDS", "6")),
-        help="How many times to click comment/reply expansion controls per visible post.",
+        help="How many times to click comment/reply expansion controls per visible post. Use 0 to expand until no more controls are found.",
     )
     parser.add_argument(
         "--scrolls",
@@ -625,7 +774,7 @@ def prefill_login_email(page: Page, email: str | None) -> None:
         print("Could not find a visible Facebook email field to prefill.")
 
 
-def click_visible_buttons(page: Page, patterns: list[str], max_clicks: int = 10) -> None:
+def click_visible_buttons(page: Page, patterns: list[str], max_clicks: int = 10) -> int:
     clicked = 0
     for pattern in patterns:
         buttons = page.get_by_role("button", name=pattern)
@@ -640,7 +789,8 @@ def click_visible_buttons(page: Page, patterns: list[str], max_clicks: int = 10)
                 continue
 
             if clicked >= max_clicks:
-                return
+                return clicked
+    return clicked
 
 
 def click_visible_buttons_in(locator: Locator, patterns: list[str], max_clicks: int = 10) -> int:
@@ -663,19 +813,40 @@ def click_visible_buttons_in(locator: Locator, patterns: list[str], max_clicks: 
     return clicked
 
 
+def click_first_visible(locator: Locator, timeout: int = 1_000, from_last: bool = False) -> bool:
+    count = locator.count()
+    indexes = range(count - 1, -1, -1) if from_last else range(count)
+    for index in indexes:
+        try:
+            item = locator.nth(index)
+            if item.is_visible(timeout=500):
+                item.scroll_into_view_if_needed(timeout=timeout)
+                item.click(timeout=timeout)
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def set_feed_sort_recent(page: Page) -> None:
+    sort_labels = re.compile(r"^(Most relevant|Recent activity|New posts)$", re.IGNORECASE)
     try:
-        page.get_by_text("Most relevant", exact=True).first.click(timeout=3_000)
-        page.wait_for_timeout(600)
+        clicked = click_first_visible(page.get_by_text(sort_labels), timeout=3_000, from_last=True)
+        if clicked:
+            page.wait_for_timeout(700)
     except Exception:
         pass
 
-    try:
-        page.get_by_text("Recent activity", exact=True).first.click(timeout=3_000)
-        page.wait_for_timeout(2_000)
-        print("Feed sort set to Recent activity.")
-    except Exception:
-        print("Could not switch feed sort. Continuing with the current Facebook sort.")
+    for label in ("New posts", "Recent activity"):
+        try:
+            if click_first_visible(page.get_by_text(label, exact=True), timeout=3_000, from_last=True):
+                page.wait_for_timeout(2_000)
+                print(f"Feed sort set to {label}.")
+                return
+        except Exception:
+            pass
+
+    print("Could not switch feed sort. Continuing with the current Facebook sort.")
 
 
 def close_floating_popups(page: Page) -> None:
@@ -692,14 +863,13 @@ def close_floating_popups(page: Page) -> None:
         pass
 
 
-def expand_visible_content(page: Page) -> None:
-    click_visible_buttons(
+def expand_visible_content(page: Page) -> int:
+    return click_visible_buttons(
         page,
         [
             "See more",
             "View more comments",
             "View previous comments",
-            "All comments",
         ],
         max_clicks=12,
     )
@@ -707,24 +877,85 @@ def expand_visible_content(page: Page) -> None:
 
 def set_comments_sort_all(page: Page) -> None:
     try:
-        page.get_by_text("Most relevant", exact=True).last.click(timeout=2_000)
-        page.wait_for_timeout(500)
+        state = page.evaluate(OPEN_ALL_COMMENTS_SORT_SCRIPT)
+        if state == "already_all_comments":
+            print("Comments sort already set to All comments.")
+            return
+        if state and state.startswith("opened_"):
+            page.wait_for_timeout(700)
+            if page.evaluate(SELECT_ALL_COMMENTS_SORT_SCRIPT):
+                page.wait_for_timeout(1_200)
+                print("Comments sort set to All comments.")
+                return
     except Exception:
         pass
 
+    sort_label = re.compile(r"^(Most relevant|Newest|All comments)$", re.IGNORECASE)
+    triggers = [
+        page.get_by_role("button", name=sort_label),
+        page.locator("span, div").filter(has_text=sort_label),
+        page.get_by_text(sort_label),
+    ]
+
+    opened = False
+    for trigger in triggers:
+        if click_first_visible(trigger, timeout=2_000, from_last=True):
+            opened = True
+            page.wait_for_timeout(700)
+            break
+
+    if not opened:
+        return
+
+    all_comments = [
+        page.get_by_role("menuitem", name=re.compile(r"^All comments$", re.IGNORECASE)),
+        page.get_by_text("All comments", exact=True),
+        page.locator("span, div").filter(has_text=re.compile(r"^All comments$", re.IGNORECASE)),
+    ]
+    for option in all_comments:
+        if click_first_visible(option, timeout=2_000, from_last=True):
+            page.wait_for_timeout(1_200)
+            print("Comments sort set to All comments.")
+            return
+
+
+def scroll_comments_down(page: Page) -> dict[str, int]:
     try:
-        page.get_by_text("All comments", exact=True).last.click(timeout=2_000)
-        page.wait_for_timeout(1_000)
-        print("Comments sort set to All comments.")
+        return page.evaluate(
+            """
+            () => {
+              const beforeY = Math.round(window.scrollY);
+              const beforeHeight = Math.round(document.documentElement.scrollHeight || document.body.scrollHeight || 0);
+              window.scrollBy(0, Math.max(1600, Math.floor(window.innerHeight * 1.8)));
+              const containers = Array.from(document.querySelectorAll('[role="dialog"], [role="main"], div'))
+                .filter((node) => node.scrollHeight > node.clientHeight + 300)
+                .sort((a, b) => b.scrollHeight - a.scrollHeight);
+              for (const container of containers.slice(0, 5)) {
+                container.scrollTop = Math.min(container.scrollTop + Math.max(1200, container.clientHeight * 1.6), container.scrollHeight);
+              }
+              return {
+                beforeY,
+                afterY: Math.round(window.scrollY),
+                beforeHeight,
+                afterHeight: Math.round(document.documentElement.scrollHeight || document.body.scrollHeight || 0)
+              };
+            }
+            """
+        )
     except Exception:
-        pass
+        page.mouse.wheel(0, 2_500)
+        return {"beforeY": 0, "afterY": 0, "beforeHeight": 0, "afterHeight": 0}
 
 
 def expand_post_page_comments(page: Page, rounds: int) -> None:
     set_comments_sort_all(page)
-    for _ in range(rounds):
-        expand_visible_content(page)
-        click_visible_buttons(
+    max_rounds = rounds if rounds > 0 else 100
+    idle_rounds = 0
+    for round_index in range(max_rounds):
+        clicked = expand_visible_content(page)
+        if round_index == 0 or round_index % 3 == 2:
+            set_comments_sort_all(page)
+        clicked += click_visible_buttons(
             page,
             [
                 "View more comments",
@@ -734,8 +965,19 @@ def expand_post_page_comments(page: Page, rounds: int) -> None:
             ],
             max_clicks=20,
         )
-        page.mouse.wheel(0, 1_800)
+        scroll_state = scroll_comments_down(page)
         page.wait_for_timeout(1_000)
+        if rounds <= 0:
+            scrolled = (
+                scroll_state.get("afterY") != scroll_state.get("beforeY")
+                or scroll_state.get("afterHeight") != scroll_state.get("beforeHeight")
+            )
+            if clicked == 0 and not scrolled:
+                idle_rounds += 1
+            else:
+                idle_rounds = 0
+            if idle_rounds >= 3:
+                break
 
 
 def expand_article_comments(page: Page, article: Locator, rounds: int) -> None:
@@ -747,14 +989,142 @@ def expand_article_comments(page: Page, article: Locator, rounds: int) -> None:
         r"view \d+ more repl",
         r"\d+ repl",
         r"more comments",
-        r"all comments",
     ]
 
-    for _ in range(rounds):
+    max_rounds = rounds if rounds > 0 else 100
+    idle_rounds = 0
+    for _ in range(max_rounds):
         clicked = click_visible_buttons_in(article, patterns, max_clicks=20)
-        if clicked == 0:
+        try:
+            article.evaluate(
+                """
+                (node) => {
+                  node.scrollIntoView({ block: "center" });
+                  const containers = Array.from(node.querySelectorAll('div'))
+                    .filter((item) => item.scrollHeight > item.clientHeight + 200)
+                    .sort((a, b) => b.scrollHeight - a.scrollHeight);
+                  for (const container of containers.slice(0, 3)) {
+                    container.scrollTop = Math.min(container.scrollTop + Math.max(800, container.clientHeight * 1.5), container.scrollHeight);
+                  }
+                }
+                """
+            )
+        except Exception:
+            pass
+        if rounds > 0 and clicked == 0:
             break
+        if rounds <= 0:
+            if clicked == 0:
+                idle_rounds += 1
+            else:
+                idle_rounds = 0
+            if idle_rounds >= 3:
+                break
         page.wait_for_timeout(900)
+
+
+def comment_key(comment: dict[str, str | None]) -> str:
+    return "|".join(
+        [
+            comment.get("author") or "",
+            comment.get("posted_at") or "",
+            comment.get("text") or "",
+        ]
+    )
+
+
+def merge_comment_lists(
+    primary: list[dict[str, str | None]],
+    secondary: list[dict[str, str | None]],
+    max_comments: int,
+) -> list[dict[str, str | None]]:
+    merged: list[dict[str, str | None]] = []
+    seen: set[str] = set()
+    for comment in [*primary, *secondary]:
+        key = comment_key(comment)
+        if not key.strip("|") or key in seen:
+            continue
+        seen.add(key)
+        merged.append(comment)
+        if max_comments > 0 and len(merged) >= max_comments:
+            break
+    return merged
+
+
+def better_count_text(current: str | None, candidate: str | None) -> str | None:
+    current_count = parse_count_text(current) if current else None
+    candidate_count = parse_count_text(candidate) if candidate else None
+    if candidate_count is None:
+        return current
+    if current_count is None or candidate_count > current_count:
+        return candidate
+    return current
+
+
+def comment_image_text(images: object) -> str:
+    if not isinstance(images, list):
+        return ""
+
+    parts = []
+    for image in images:
+        if not isinstance(image, dict):
+            continue
+        alt = str(image.get("alt") or "").strip()
+        if alt:
+            parts.append(alt)
+    return " ".join(parts).strip()
+
+
+def collect_comments_while_expanding(
+    page: Page,
+    max_comments: int,
+    rounds: int,
+) -> list[dict[str, str | None]]:
+    comments: list[dict[str, str | None]] = []
+    set_comments_sort_all(page)
+    max_rounds = rounds if rounds > 0 else 100
+    idle_rounds = 0
+
+    for round_index in range(max_rounds):
+        comments = merge_comment_lists(comments, extract_comments_from_page(page, max_comments), max_comments)
+        if max_comments > 0 and len(comments) >= max_comments:
+            break
+
+        clicked = expand_visible_content(page)
+        if round_index == 0 or round_index % 3 == 2:
+            set_comments_sort_all(page)
+        clicked += click_visible_buttons(
+            page,
+            [
+                "View more comments",
+                "View previous comments",
+                "View more replies",
+                "See more",
+            ],
+            max_clicks=20,
+        )
+        page.wait_for_timeout(700)
+        comments = merge_comment_lists(comments, extract_comments_from_page(page, max_comments), max_comments)
+        scroll_state = scroll_comments_down(page)
+        page.wait_for_timeout(1_000)
+        comments = merge_comment_lists(comments, extract_comments_from_page(page, max_comments), max_comments)
+
+        if rounds <= 0:
+            scrolled = (
+                scroll_state.get("afterY") != scroll_state.get("beforeY")
+                or scroll_state.get("afterHeight") != scroll_state.get("beforeHeight")
+            )
+            if clicked == 0 and not scrolled:
+                idle_rounds += 1
+            else:
+                idle_rounds = 0
+            if idle_rounds >= 3:
+                break
+        elif clicked == 0:
+            break
+
+    print(f"Progressive comment scan collected {len(comments)} unique rows.")
+    return comments
 
 
 def text_from(locator: Locator) -> str:
@@ -812,7 +1182,12 @@ def clean_comment_text(text: str, author: str | None, posted_at: str | None) -> 
             continue
         cleaned_lines.append(value)
 
-    return "\n".join(cleaned_lines).strip()
+    cleaned = "\n".join(cleaned_lines).strip()
+    if author and cleaned.startswith(author):
+        cleaned = cleaned[len(author) :].strip()
+    if posted_at and cleaned.endswith(posted_at):
+        cleaned = cleaned[: -len(posted_at)].strip()
+    return cleaned
 
 
 def is_nested_article(article: Locator) -> bool:
@@ -916,6 +1291,64 @@ def enrich_details_from_parts(
 
 def extract_engagement_text(page: Page, article: Locator) -> dict[str, str | None]:
     text = text_from(article) or text_from(page.locator("body"))
+    dom_counts = {"reactions_text": None, "comment_count_text": None, "share_count_text": None}
+    try:
+        dom_counts = article.evaluate(
+            """
+            (root) => {
+              const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
+              const textParts = (node) => {
+                const parts = [];
+                const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+                while (walker.nextNode()) {
+                  const value = clean(walker.currentNode.textContent);
+                  if (value) parts.push(value);
+                }
+                return [...new Set(parts)];
+              };
+              const counterNear = (selector, label) => {
+                const target = root.querySelector(selector);
+                if (!target) return null;
+                let node = target;
+                for (let depth = 0; depth < 7 && node; depth += 1) {
+                  const parts = textParts(node);
+                  const labelled = parts.find((part) => new RegExp(`^\\\\d+(?:[,.]\\\\d+)*(?:\\\\.\\\\d+)?\\\\s+${label}s?$`, "i").test(part));
+                  const numberOnly = parts.find((part) => /^[\\d,.]+$/.test(part));
+                  if (labelled) return labelled;
+                  if (numberOnly) return `${numberOnly} ${label}${numberOnly === "1" ? "" : "s"}`;
+                  node = node.parentElement;
+                }
+                return null;
+              };
+              const countFromText = (value) => {
+                const match = clean(value).replace(/,/g, "").match(/(\\d+(?:\\.\\d+)?)/);
+                return match ? Number(match[1]) : null;
+              };
+              const betterCountText = (current, candidate) => {
+                const currentCount = countFromText(current);
+                const candidateCount = countFromText(candidate);
+                if (candidateCount === null) return current;
+                if (currentCount === null || candidateCount > currentCount) return candidate;
+                return current;
+              };
+              const ariaReactions = Array.from(root.querySelectorAll('[aria-label]'))
+                .map((node) => clean(node.getAttribute("aria-label")))
+                .filter((value) => /^(?:Like|Love|Care|Haha|Wow|Sad|Angry):\\s*[\\d,.]+\\s+people?/i.test(value));
+              const ariaReaction = ariaReactions.sort((a, b) => {
+                const count = (value) => Number((value.match(/[\\d,.]+/) || ["0"])[0].replace(/,/g, ""));
+                return count(b) - count(a);
+              })[0] || null;
+              const visibleReaction = counterNear('[data-ad-rendering-role="like_button"], [aria-label="Like"], [aria-label="React"]', "reaction");
+              return {
+                reactions_text: betterCountText(visibleReaction, ariaReaction),
+                comment_count_text: counterNear('[data-ad-rendering-role="comment_button"], [aria-label="Leave a comment"], [aria-label="Comment"]', "comment"),
+                share_count_text: counterNear('[data-ad-rendering-role="share_button"], [aria-label="Share"]', "share")
+              };
+            }
+            """
+        )
+    except Exception:
+        pass
     reaction_match = re.search(
         r"(All reactions:\s*[^\n]+|\b\d+\s*(?:reaction|like)s?\b)",
         text,
@@ -925,10 +1358,18 @@ def extract_engagement_text(page: Page, article: Locator) -> dict[str, str | Non
     share_match = re.search(r"\b\d+\s+shares?\b", text, re.IGNORECASE)
 
     return {
-        "reactions_text": reaction_match.group(1) if reaction_match else None,
-        "comment_count_text": comment_match.group(0) if comment_match else None,
-        "share_count_text": share_match.group(0) if share_match else None,
+        "reactions_text": dom_counts.get("reactions_text") or (reaction_match.group(1) if reaction_match else None),
+        "comment_count_text": dom_counts.get("comment_count_text") or (comment_match.group(0) if comment_match else None),
+        "share_count_text": dom_counts.get("share_count_text") or (share_match.group(0) if share_match else None),
     }
+
+
+def extract_images(locator: Locator) -> list[dict[str, object]]:
+    try:
+        images = locator.evaluate(IMAGE_DETAILS_SCRIPT)
+        return images if isinstance(images, list) else []
+    except Exception:
+        return []
 
 
 def clean_post_details(details: dict[str, str | None]) -> dict[str, str | None]:
@@ -1166,7 +1607,11 @@ def scrape_post_page(
     print(f"Opening post: {post_url}")
     page.goto(post_url, wait_until="domcontentloaded")
     page.wait_for_timeout(3_000)
-    expand_post_page_comments(page, comment_expand_rounds)
+    progressive_comments = collect_comments_while_expanding(
+        page,
+        max_comments,
+        comment_expand_rounds,
+    )
 
     top_articles = [
         page.locator("div[role='article']").nth(index)
@@ -1186,10 +1631,9 @@ def scrape_post_page(
         if len(details["text"] or details["raw_text"] or "") < 3:
             continue
 
-        comments = extract_comments(article, max_comments)
+        comments = merge_comment_lists(progressive_comments, extract_comments(article, max_comments), max_comments)
         page_comments = extract_comments_from_page(page, max_comments)
-        if len(page_comments) > len(comments):
-            comments = page_comments
+        comments = merge_comment_lists(comments, page_comments, max_comments)
 
         post = Post(
             id=make_post_id(details),
@@ -1203,13 +1647,18 @@ def scrape_post_page(
             comment_count_text=engagement["comment_count_text"],
             share_count_text=engagement["share_count_text"],
             comments=comments,
+            images=extract_images(article),
         )
         if not post.comments:
             print("No comments found on desktop post page. Trying mobile post page.")
             page.goto(mobile_url(post_url), wait_until="domcontentloaded")
             page.wait_for_timeout(3_000)
-            expand_post_page_comments(page, max(3, comment_expand_rounds // 2))
-            post.comments = extract_comments_from_page(page, max_comments)
+            mobile_rounds = max(3, comment_expand_rounds // 2) if comment_expand_rounds > 0 else 0
+            post.comments = merge_comment_lists(
+                post.comments,
+                collect_comments_while_expanding(page, max_comments, mobile_rounds),
+                max_comments,
+            )
             if not post.comments:
                 debug_paths = write_debug_files(page, debug_dir, post.id)
                 print(
@@ -1218,7 +1667,11 @@ def scrape_post_page(
                 )
         return post
 
-    page_comments = extract_comments_from_page(page, max_comments)
+    page_comments = merge_comment_lists(
+        progressive_comments,
+        extract_comments_from_page(page, max_comments),
+        max_comments,
+    )
     page_text = text_from(page.locator("body"))
     debug_paths = write_debug_files(page, debug_dir, post_id_from_url(post_url))
     print(
@@ -1241,6 +1694,7 @@ def scrape_post_page(
         comment_count_text=None,
         share_count_text=None,
         comments=page_comments,
+        images=extract_images(page.locator("body")),
     )
 
 
@@ -1286,6 +1740,7 @@ def collect_posts(
                 comment_count_text=engagement["comment_count_text"],
                 share_count_text=engagement["share_count_text"],
                 comments=comments,
+                images=extract_images(article),
             )
         )
 
@@ -1315,7 +1770,7 @@ def post_text_from_feed_parts(parts: list[str], author: str | None, posted_at: s
     return re.sub(r"\s+", " ", text)
 
 
-def collect_visible_feed_posts(page: Page, max_posts: int) -> list[Post]:
+def collect_visible_feed_posts(page: Page, max_posts: int, max_comments: int) -> list[Post]:
     posts: list[Post] = []
     seen: set[str] = set()
     try:
@@ -1373,6 +1828,7 @@ def collect_visible_feed_posts(page: Page, max_posts: int) -> list[Post]:
                 comment_count_text=card.get("commentCountText"),
                 share_count_text=card.get("shareCountText"),
                 comments=card_comments,
+                images=card.get("images") or [],
             )
         )
         if len(posts) >= max_posts:
@@ -1418,7 +1874,8 @@ def collect_visible_feed_posts(page: Page, max_posts: int) -> list[Post]:
                 reactions_text=engagement["reactions_text"],
                 comment_count_text=engagement["comment_count_text"],
                 share_count_text=engagement["share_count_text"],
-                comments=extract_comments(article, 200),
+                comments=extract_comments(article, max_comments),
+                images=card.get("images") or extract_images(article),
             )
         )
 
@@ -1432,6 +1889,7 @@ def collect_visible_feed_posts_over_scrolls(
     page: Page,
     group_url: str,
     max_posts: int,
+    max_comments: int,
     scrolls: int,
 ) -> list[Post]:
     page.goto(group_url, wait_until="domcontentloaded")
@@ -1441,7 +1899,7 @@ def collect_visible_feed_posts_over_scrolls(
     posts: list[Post] = []
     for scroll in range(scrolls):
         close_floating_popups(page)
-        visible_posts = collect_visible_feed_posts(page, max_posts)
+        visible_posts = collect_visible_feed_posts(page, max_posts, max_comments)
         posts = merge_posts(posts, visible_posts, max_posts)
         print(f"Visible feed scan {scroll + 1}/{scrolls}: collected {len(posts)} post cards")
         if len(posts) >= max_posts:
@@ -1510,7 +1968,7 @@ def collect_posts_by_clicking_feed_comments(
                 continue
 
             visible_post = None
-            visible = collect_visible_post_from_article(page, article, index)
+            visible = collect_visible_post_from_article(page, article, index, max_comments)
             if visible:
                 visible_post = visible
 
@@ -1546,7 +2004,12 @@ def collect_posts_by_clicking_feed_comments(
     return posts
 
 
-def collect_visible_post_from_article(page: Page, article: Locator, index: int) -> Post | None:
+def collect_visible_post_from_article(
+    page: Page,
+    article: Locator,
+    index: int,
+    max_comments: int,
+) -> Post | None:
     try:
         card = article.evaluate(FEED_CARD_SCRIPT)
     except Exception:
@@ -1576,7 +2039,8 @@ def collect_visible_post_from_article(page: Page, article: Locator, index: int) 
         reactions_text=engagement["reactions_text"],
         comment_count_text=engagement["comment_count_text"],
         share_count_text=engagement["share_count_text"],
-        comments=extract_comments(article, 200),
+        comments=extract_comments(article, max_comments),
+        images=card.get("images") or extract_images(article),
     )
 
 
@@ -1602,6 +2066,8 @@ def post_quality_score(post: Post) -> int:
         score += 10
     if post.share_count_text:
         score += 5
+    if post.images:
+        score += min(15, len(post.images) * 5)
 
     # Big body dumps are usually failed extraction pages, not useful post rows.
     if not text and len(raw_text) > 1200:
@@ -1630,6 +2096,12 @@ def merge_posts(primary: list[Post], secondary: list[Post], max_posts: int) -> l
     merged: list[Post] = []
     key_to_index: dict[str, int] = {}
 
+    def rebuild_index() -> None:
+        key_to_index.clear()
+        for item_index, item in enumerate(merged):
+            for item_key in post_keys(item):
+                key_to_index[item_key] = item_index
+
     for post in [*primary, *secondary]:
         if not post:
             continue
@@ -1643,15 +2115,22 @@ def merge_posts(primary: list[Post], secondary: list[Post], max_posts: int) -> l
 
             if post_quality_score(post) > post_quality_score(current):
                 # Keep useful fields from both rows.
-                if not post.comments and current.comments:
+                if len(current.comments or []) > len(post.comments or []):
                     post.comments = current.comments
-                if not post.reactions_text:
-                    post.reactions_text = current.reactions_text
-                if not post.comment_count_text:
-                    post.comment_count_text = current.comment_count_text
-                if not post.share_count_text:
-                    post.share_count_text = current.share_count_text
+                post.reactions_text = better_count_text(post.reactions_text, current.reactions_text)
+                post.comment_count_text = better_count_text(post.comment_count_text, current.comment_count_text)
+                post.share_count_text = better_count_text(post.share_count_text, current.share_count_text)
+                if not post.images and current.images:
+                    post.images = current.images
                 merged[target_index] = post
+            else:
+                if not current.images and post.images:
+                    current.images = post.images
+                if len(post.comments or []) > len(current.comments or []):
+                    current.comments = post.comments
+                current.reactions_text = better_count_text(current.reactions_text, post.reactions_text)
+                current.comment_count_text = better_count_text(current.comment_count_text, post.comment_count_text)
+                current.share_count_text = better_count_text(current.share_count_text, post.share_count_text)
 
             for key in keys:
                 key_to_index[key] = target_index
@@ -1662,7 +2141,11 @@ def merge_posts(primary: list[Post], secondary: list[Post], max_posts: int) -> l
             continue
 
         if len(merged) >= max_posts:
-            break
+            weakest_index = min(range(len(merged)), key=lambda item_index: post_quality_score(merged[item_index]))
+            if post_quality_score(post) > post_quality_score(merged[weakest_index]):
+                merged[weakest_index] = post
+                rebuild_index()
+            continue
 
         index = len(merged)
         merged.append(post)
@@ -1706,8 +2189,18 @@ def extract_comments(article: Locator, max_comments: int) -> list[dict[str, str 
             details.get("author"),
             details.get("postedAt"),
         )
-        key = "|".join([details.get("author") or "", details.get("postedAt") or "", text])
-        if len(text) < 2 or key in seen:
+        images = details.get("images") or []
+        if len(text) < 2:
+            text = comment_image_text(images)
+        key = "|".join(
+            [
+                details.get("author") or "",
+                details.get("postedAt") or "",
+                text,
+                comment_image_text(images),
+            ]
+        )
+        if (len(text) < 2 and not images) or key in seen:
             continue
         if text.startswith("Like Reply") or text == "Comment":
             continue
@@ -1718,11 +2211,12 @@ def extract_comments(article: Locator, max_comments: int) -> list[dict[str, str 
                 "author": details.get("author"),
                 "posted_at": details.get("postedAt"),
                 "text": text,
-                "reactions": details.get("reactionsText"),
+                "reactions": clean_comment_reaction(details.get("reactionsText")),
+                "images": images,
             }
         )
 
-        if len(comments) >= max_comments:
+        if max_comments > 0 and len(comments) >= max_comments:
             break
 
     return comments
@@ -1769,8 +2263,18 @@ def extract_comments_from_page(page: Page, max_comments: int) -> list[dict[str, 
                 details.get("author"),
                 details.get("postedAt"),
             )
-            key = "|".join([details.get("author") or "", details.get("postedAt") or "", text])
-            if len(text) < 2 or key in seen:
+            images = details.get("images") or []
+            if len(text) < 2:
+                text = comment_image_text(images)
+            key = "|".join(
+                [
+                    details.get("author") or "",
+                    details.get("postedAt") or "",
+                    text,
+                    comment_image_text(images),
+                ]
+            )
+            if (len(text) < 2 and not images) or key in seen:
                 continue
             if re.search(r"^(Like|Reply|Share|Comment|Write a comment)", text, re.I):
                 continue
@@ -1781,10 +2285,11 @@ def extract_comments_from_page(page: Page, max_comments: int) -> list[dict[str, 
                     "author": details.get("author"),
                     "posted_at": details.get("postedAt"),
                     "text": text,
-                    "reactions": details.get("reactionsText"),
+                    "reactions": clean_comment_reaction(details.get("reactionsText")),
+                    "images": images,
                 }
             )
-            if len(comments) >= max_comments:
+            if max_comments > 0 and len(comments) >= max_comments:
                 return comments
 
     return comments
@@ -1812,10 +2317,70 @@ def write_debug_files(page: Page, debug_dir: str, post_id: str) -> DebugPaths:
     )
 
 
+def parse_count_text(value: str | None) -> int | None:
+    if not value:
+        return None
+
+    match = re.search(r"(\d+(?:\.\d+)?)\s*([KMB])?", value.replace(",", ""), re.I)
+    if not match:
+        return None
+
+    number = float(match.group(1))
+    suffix = (match.group(2) or "").upper()
+    multiplier = {"K": 1_000, "M": 1_000_000, "B": 1_000_000_000}.get(suffix, 1)
+    return int(number * multiplier)
+
+
+def repair_mojibake(value: object) -> object:
+    if isinstance(value, str):
+        if not any(marker in value for marker in ("à", "Â", "Ã", "�")):
+            return value
+        try:
+            repaired = value.encode("latin1").decode("utf-8")
+        except UnicodeError:
+            return value
+        thai_before = len(re.findall(r"[\u0E00-\u0E7F]", value))
+        thai_after = len(re.findall(r"[\u0E00-\u0E7F]", repaired))
+        if thai_after > thai_before:
+            return repaired
+        return value
+    if isinstance(value, list):
+        return [repair_mojibake(item) for item in value]
+    if isinstance(value, dict):
+        return {key: repair_mojibake(item) for key, item in value.items()}
+    return value
+
+
+def clean_comment_reaction(value: object) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if re.match(r"^\d+\s*(like|likes|reaction|reactions)$", text, re.IGNORECASE):
+        return text
+    if re.match(r"^[1-9]\d{0,2}$", text):
+        return text
+    return None
+
+
+def serialize_post(post: Post) -> dict:
+    data = post.__dict__.copy()
+    comments = post.comments or []
+    reaction_count = parse_count_text(post.reactions_text)
+    total_comment_count = parse_count_text(post.comment_count_text)
+    share_count = parse_count_text(post.share_count_text)
+    data["reaction_count"] = reaction_count if reaction_count is not None else 0
+    data["total_comment_count"] = total_comment_count if total_comment_count is not None else len(comments)
+    data["share_count"] = share_count if share_count is not None else 0
+    data["comments_found"] = len(comments)
+    data["missing_comment_count"] = max(0, data["total_comment_count"] - len(comments))
+    data["comments_complete"] = len(comments) >= data["total_comment_count"]
+    return repair_mojibake(data)
+
+
 def save_json(path: str, metadata: GroupMetadata, posts: list[Post]) -> Path:
     data = {
         "group": metadata.__dict__,
-        "posts": [post.__dict__ for post in posts],
+        "posts": [serialize_post(post) for post in posts],
     }
     output_path = writable_output_path(path)
     output_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -2023,6 +2588,7 @@ def main() -> None:
             page,
             group_url,
             args.max_posts,
+            args.max_comments,
             max(3, args.scrolls // 3),
         )
 
