@@ -6,10 +6,16 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
+from urllib.request import Request, urlopen
 
 from playwright.sync_api import Locator, Page, sync_playwright
 
@@ -144,6 +150,7 @@ COMMENT_CLEANUP_SCRIPT = """
 
   const rawText = clean(clone.innerText);
   let text = cleanupText(rawText, author, postedAt);
+  const rect = root.getBoundingClientRect();
   const images = Array.from(root.querySelectorAll('img'))
     .map((img) => ({
       src: img.currentSrc || img.src || null,
@@ -155,7 +162,7 @@ COMMENT_CLEANUP_SCRIPT = """
     .filter((img) => img.src && !img.src.startsWith("data:image/svg"))
     .filter((img) => img.alt || /fbcdn|scontent/i.test(img.src || ""));
 
-  return { author, postedAt, reactionsText, text, rawText, ariaLabel, images };
+  return { author, postedAt, reactionsText, text, rawText, ariaLabel, images, left: Math.round(rect.left), top: Math.round(rect.top) };
 }
 """
 
@@ -181,6 +188,21 @@ TEXT_PARTS_SCRIPT = """
 IMAGE_DETAILS_SCRIPT = """
 (root) => {
   const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
+  const backgroundImages = Array.from(root.querySelectorAll('*'))
+    .map((node) => {
+      const style = window.getComputedStyle(node);
+      const bg = style.backgroundImage || "";
+      const match = bg.match(/url\\(["']?(.*?)["']?\\)/);
+      const rect = node.getBoundingClientRect();
+      return match ? {
+        src: match[1],
+        alt: "",
+        width: Math.round(rect.width) || null,
+        height: Math.round(rect.height) || null,
+        perfLogName: "backgroundImage"
+      } : null;
+    })
+    .filter(Boolean);
   const images = Array.from(root.querySelectorAll('img'))
     .map((img) => ({
       src: img.currentSrc || img.src || null,
@@ -191,7 +213,7 @@ IMAGE_DETAILS_SCRIPT = """
     }))
     .filter((img) => img.src && !img.src.startsWith("data:image/svg"))
     .filter((img) => img.alt || /fbcdn|scontent/i.test(img.src || ""));
-  return images.filter((img, index, arr) => {
+  return [...images, ...backgroundImages].filter((img, index, arr) => {
     const key = `${img.src}|${img.alt}`;
     return arr.findIndex((other) => `${other.src}|${other.alt}` === key) === index;
   });
@@ -363,15 +385,66 @@ FEED_CARD_SCRIPT = """
   }
   const unique = [...new Set(lines)];
   const author = unique.find((line) => !/^(\\d+|\\.|Admin|Author|created the group)/i.test(line)) || null;
-  const postedAt = unique.find((line) => /\\b(\\d+\\s*(m|h|d|w)|\\d{1,2}\\s+[A-Z][a-z]+\\s+at\\s+\\d{1,2}:\\d{2}|Yesterday|Just now)\\b/i.test(line)) || null;
+  const postedAt = unique.find((line) => line.length <= 40 && /\\b(\\d+\\s*(m|h|d|w)|\\d{1,2}\\s+[A-Z][a-z]+\\s+at\\s+\\d{1,2}:\\d{2}|Yesterday|Just now)\\b/i.test(line)) || null;
+  const rootRect = root.getBoundingClientRect();
+  const headerPostedAt = () => {
+    const nodes = Array.from(root.querySelectorAll('a[role="link"], a, span, div'));
+    for (const node of nodes) {
+      const nodeRect = node.getBoundingClientRect();
+      if (nodeRect.top < rootRect.top - 5 || nodeRect.top > rootRect.top + 240) continue;
+      const labelledBy = node.getAttribute("aria-labelledby");
+      const labelText = labelledBy
+        ? clean(labelledBy.split(/\\s+/).map((id) => document.getElementById(id)?.innerText || "").join(" "))
+        : "";
+      const text = clean(labelText || node.getAttribute("aria-label") || node.getAttribute("title") || node.innerText || "");
+      if (!text || text.length > 80) continue;
+      const direct = text.match(/^(Just now|Yesterday|\\d+\\s*(?:m|h|d|w|mo|y))$/i);
+      if (direct) return direct[1].replace(/\\s+/g, "");
+      const relative = text.match(/^(?:a|an|\\d+)\\s+(?:second|minute|hour|day|week|month|year)s?\\s+ago$/i);
+      if (relative) return text;
+      const fullDate = text.match(/^[A-Z][a-z]+,\\s+[A-Z][a-z]+\\s+\\d{1,2}(?:,\\s*\\d{4})?(?:\\s+at\\s+.+)?$/i);
+      if (fullDate) return text;
+      const shortDate = text.match(/^[A-Z][a-z]{2,8}\\s+\\d{1,2}(?:,\\s*\\d{4})?(?:\\s+at\\s+.+)?$/i);
+      if (shortDate) return text;
+    }
+    return null;
+  };
+  const visualPostedAt = () => {
+    const rows = new Map();
+    Array.from(root.querySelectorAll('span, a, div')).forEach((node) => {
+      const text = clean(node.innerText || node.textContent);
+      if (!/^(\\d+|[mhdw]|mo|y|·)$/.test(text)) return;
+      const rect = node.getBoundingClientRect();
+      const style = window.getComputedStyle(node);
+      if (rect.width <= 0 || rect.height <= 0 || style.visibility === "hidden" || style.display === "none" || Number(style.opacity) === 0) return;
+      if (style.position === "absolute") return;
+      if (rect.y > rootRect.top + 240) return;
+      const y = Math.round(rect.y);
+      if (!rows.has(y)) rows.set(y, []);
+      rows.get(y).push({ text, x: rect.x });
+    });
+    for (const items of rows.values()) {
+      const value = items.sort((a, b) => a.x - b.x).map((item) => item.text).join("").replace(/·/g, "");
+      const match = value.match(/\\d+(?:m|h)/i);
+      if (match) return match[0];
+    }
+    return null;
+  };
+  const isObfuscated = (value) => {
+    const tokens = value.split(/\\s+/);
+    if (tokens.length < 8) return false;
+    const singleChar = tokens.filter((t) => t.length <= 2 && /^[a-zA-Z0-9]+$/.test(t)).length;
+    return singleChar / tokens.length >= 0.6;
+  };
   const urlNode = Array.from(root.querySelectorAll('a[href]')).find((node) => {
     const href = node.href || "";
+    if (href.includes("comment_id=")) return false;
     return href.includes("/posts/") || href.includes("/permalink/") || href.includes("story_fbid");
   });
   const styledTexts = Array.from(root.querySelectorAll('div[style*="font-size"], div[style*="text-align"]'))
     .map((node) => {
       const style = window.getComputedStyle(node);
-      const value = clean(node.innerText || node.textContent);
+      const value = clean(`${node.innerText || node.textContent || ""} ${Array.from(node.querySelectorAll('img[alt]')).map((img) => img.getAttribute('alt') || '').join(" ")}`);
       return {
         value,
         fontSize: parseFloat(style.fontSize || "0"),
@@ -380,9 +453,11 @@ FEED_CARD_SCRIPT = """
       };
     })
     .filter((item) => item.value && item.value.length > 3)
+    .filter((item) => !isObfuscated(item.value))
     .filter((item) => item.fontSize >= 20 || item.fontWeight >= 600 || item.rect.height > 80)
     .map((item) => item.value)
-    .filter((value, index, arr) => arr.indexOf(value) === index);
+    .filter((value, index, arr) => arr.indexOf(value) === index)
+    .filter((value, index, arr) => !arr.some((other, otherIndex) => otherIndex !== index && other.includes(value) && other.length > value.length));
   const reactionFromAria = Array.from(root.querySelectorAll('[aria-label]'))
     .map((node) => clean(node.getAttribute("aria-label")))
     .find((value) => /^(?:Like|Love|Care|Haha|Wow|Sad|Angry):\\s*[\\d,.]+\\s+people?/i.test(value));
@@ -398,7 +473,7 @@ FEED_CARD_SCRIPT = """
     .filter((img) => img.alt || /fbcdn|scontent/i.test(img.src || ""));
   return {
     author,
-    postedAt,
+    postedAt: headerPostedAt() || postedAt || visualPostedAt(),
     url: urlNode ? urlNode.href : null,
     parts: [...styledTexts, ...unique],
     text: styledTexts.join("\\n").trim(),
@@ -413,7 +488,7 @@ FEED_CARDS_FROM_PAGE_SCRIPT = """
 () => {
   const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
 
-  const timeRegex = /^(?:just now|yesterday(?: at .*)?|today(?: at .*)?|(?:a|an|\\d+)\\s+(?:second|minute|hour|day|week|month|year)s?\\s+ago|\\d+\\s*(?:m|h|d|w|mo|y)|\\d{1,2}\\s+[A-Z][a-z]{2,8}(?:\\s+at\\s+.*)?|[A-Z][a-z]{2,8}\\s+\\d{1,2}(?:\\s+at\\s+.*)?)$/i;
+  const timeRegex = /^(?:just now|yesterday(?: at .*)?|today(?: at .*)?|(?:a|an|\\d+)\\s+(?:second|minute|hour|day|week|month|year)s?\\s+ago|\\d+\\s*(?:m|h|d|w|mo|y)|\\d{1,2}\\s+[A-Z][a-z]{2,8}(?:\\s+at\\s+.*)?|[A-Z][a-z]{2,8}\\s+\\d{1,2}(?:\\s+at\\s+.*)?|[A-Z][a-z]+,\\s+[A-Z][a-z]+\\s+\\d{1,2}(?:,\\s*\\d{4})?(?:\\s+at\\s+.*)?)$/i;
 
   const noise = new Set([
     "Facebook", "Like", "Reply", "Share", "Comment", "Send", "GIF",
@@ -439,7 +514,7 @@ FEED_CARDS_FROM_PAGE_SCRIPT = """
   const styledTextNodes = () => Array.from(document.querySelectorAll('div[style*="font-size"], div[style*="text-align"]'))
     .filter((node) => {
       const style = window.getComputedStyle(node);
-      const text = clean(node.innerText || node.textContent);
+      const text = clean(`${node.innerText || node.textContent || ""} ${Array.from(node.querySelectorAll('img[alt]')).map((img) => img.getAttribute('alt') || '').join(" ")}`);
       const rect = node.getBoundingClientRect();
       return text.length > 3 && (parseFloat(style.fontSize || "0") >= 20 || Number(style.fontWeight) >= 600 || rect.height > 80);
     });
@@ -622,30 +697,125 @@ FEED_CARDS_FROM_PAGE_SCRIPT = """
 
     const author = actionAuthor || (authorNode ? clean(authorNode.getAttribute("aria-label") || authorNode.innerText || authorNode.textContent) : null);
 
+    // Detect Facebook's anti-scraping obfuscation: text where 60%+ of space-separated
+    // tokens are single alphanumeric chars (e.g. "e S s d p o t r n o 4 9 5 9 2 0 ...").
+    const isObfuscated = (value) => {
+      const tokens = value.split(/\\s+/);
+      if (tokens.length < 8) return false;
+      const singleChar = tokens.filter((t) => t.length <= 2 && /^[a-zA-Z0-9]+$/.test(t)).length;
+      return singleChar / tokens.length >= 0.6;
+    };
     const styleTexts = styledTextNodes()
       .filter((node) => card.contains(node))
-      .map((node) => clean(node.innerText || node.textContent))
-      .filter(Boolean);
+      .map((node) => clean(`${node.innerText || node.textContent || ""} ${Array.from(node.querySelectorAll('img[alt]')).map((img) => img.getAttribute('alt') || '').join(" ")}`))
+      .filter(Boolean)
+      .filter((value) => !isObfuscated(value));
     const storyTexts = [
       ...styleTexts,
       ...Array.from(card.querySelectorAll('[data-ad-rendering-role="story_message"]'))
       .map((node) => clean(node.innerText || node.textContent))
       .filter(Boolean)
-    ].filter((value, index, arr) => arr.indexOf(value) === index);
+      .filter((value) => !isObfuscated(value))
+    ]
+      .filter((value, index, arr) => arr.indexOf(value) === index)
+      .filter((value, index, arr) => !arr.some((other, otherIndex) => otherIndex !== index && other.includes(value) && other.length > value.length));
 
     const urlNode = Array.from(card.querySelectorAll('a[href]')).find((node) => {
       const href = node.href || node.getAttribute("href") || "";
       return href.includes("/posts/") || href.includes("/permalink/") || href.includes("story_fbid");
     });
 
-    const timeNode = Array.from(card.querySelectorAll('a, span')).find((node) => {
+    // A genuinely embedded shared post is a role="article" that is itself nested inside
+    // another role="article" within the same card. Regular post articles are not nested.
+    const nestedArticles = Array.from(card.querySelectorAll('[role="article"]')).filter((a) => {
+      let node = a.parentElement;
+      while (node && node !== card) {
+        if (node.getAttribute("role") === "article") return true;
+        node = node.parentElement;
+      }
+      return false;
+    });
+    const isInsideSharedPost = nestedArticles.length > 0
+      ? (node) => nestedArticles.some((art) => art.contains(node))
+      : () => false;
+
+    const headerPostedAt = () => {
+      // Include a, span, div — Facebook sometimes renders time in div elements.
+      // Do NOT filter by visibility/dimensions: time links can be hidden or zero-size
+      // yet still carry the correct aria-label (e.g. anti-scraping obfuscation).
+      const nodes = Array.from(card.querySelectorAll('a[role="link"], a, span, div'))
+        .filter((node) => !isInsideSharedPost(node));
+      for (const node of nodes) {
+        const nodeRect = node.getBoundingClientRect();
+        if (nodeRect.top < rect.top - 5 || nodeRect.top > rect.top + 240) continue;
+        const labelledBy = node.getAttribute("aria-labelledby");
+        const labelText = labelledBy
+          ? clean(labelledBy.split(/\\s+/).map((id) => document.getElementById(id)?.innerText || "").join(" "))
+          : "";
+        const text = clean(labelText || node.getAttribute("aria-label") || node.getAttribute("title") || node.innerText || "");
+        if (!text || text.length > 80) continue;
+        const direct = text.match(/^(Just now|Yesterday|\\d+\\s*(?:m|h|d|w|mo|y))$/i);
+        if (direct) return direct[1].replace(/\\s+/g, "");
+        const relative = text.match(/^(?:a|an|\\d+)\\s+(?:second|minute|hour|day|week|month|year)s?\\s+ago$/i);
+        if (relative) return text;
+        const fullDate = text.match(/^[A-Z][a-z]+,\\s+[A-Z][a-z]+\\s+\\d{1,2}(?:,\\s*\\d{4})?(?:\\s+at\\s+.+)?$/i);
+        if (fullDate) return text;
+        const shortDate = text.match(/^[A-Z][a-z]{2,8}\\s+\\d{1,2}(?:,\\s*\\d{4})?(?:\\s+at\\s+.+)?$/i);
+        if (shortDate) return text;
+      }
+      return null;
+    };
+
+    const postLinkTimeNode = Array.from(card.querySelectorAll('a[href]')).find((node) => {
+      if (isInsideSharedPost(node)) return false;
+      const href = node.href || "";
+      if (!(href.includes("/posts/") || href.includes("/permalink/") || href.includes("story_fbid"))) return false;
+      if (href.includes("comment_id=")) return false;
+      const nodeRect = node.getBoundingClientRect();
+      if (nodeRect.top > rect.top + 240) return false;
       const value = clean(node.getAttribute("aria-label") || node.getAttribute("title") || node.innerText || node.textContent || "");
-      return timeRegex.test(value);
+      return value.length <= 80 && timeRegex.test(value);
+    });
+
+    const timeNode = postLinkTimeNode || Array.from(card.querySelectorAll('a, span, div')).find((node) => {
+      if (isInsideSharedPost(node)) return false;
+      const nodeRect = node.getBoundingClientRect();
+      if (nodeRect.top < rect.top - 5 || nodeRect.top > rect.top + 240) return false;
+      const value = clean(node.getAttribute("aria-label") || node.getAttribute("title") || node.innerText || node.textContent || "");
+      return value.length <= 80 && timeRegex.test(value);
     });
 
     const postedAt = timeNode
-      ? clean(timeNode.getAttribute("aria-label") || timeNode.getAttribute("title") || timeNode.innerText || timeNode.textContent)
+      ? (() => {
+          const ariaLabel = clean(timeNode.getAttribute("aria-label") || "");
+          const titleAttr = clean(timeNode.getAttribute("title") || "");
+          const absDateRe = /[A-Z][a-z]+\s+\d{1,2}(?:,\s*\d{4})?(?:\s+at\s+.+)?/i;
+          if (absDateRe.test(titleAttr)) return titleAttr;
+          if (absDateRe.test(ariaLabel)) return ariaLabel;
+          return ariaLabel || titleAttr || clean(timeNode.innerText || timeNode.textContent);
+        })()
       : null;
+    const visualPostedAt = () => {
+      const rows = new Map();
+      Array.from(card.querySelectorAll('span, a, div')).forEach((node) => {
+        const text = clean(node.innerText || node.textContent);
+        if (!/^(\\d+|[mhdw]|mo|y|·)$/.test(text)) return;
+        const nodeRect = node.getBoundingClientRect();
+        const style = window.getComputedStyle(node);
+        if (nodeRect.width <= 0 || nodeRect.height <= 0 || style.visibility === "hidden" || style.display === "none" || Number(style.opacity) === 0) return;
+        if (style.position === "absolute") return;
+        if (nodeRect.y > rect.top + 240) return;
+        const y = Math.round(nodeRect.y);
+        if (!rows.has(y)) rows.set(y, []);
+        rows.get(y).push({ text, x: nodeRect.x });
+      });
+      for (const items of rows.values()) {
+        const value = items.sort((a, b) => a.x - b.x).map((item) => item.text).join("").replace(/·/g, "");
+        const match = value.match(/\\d+(?:m|h)/i);
+        if (match) return match[0];
+      }
+      return null;
+    };
 
     const comments = Array.from(card.querySelectorAll('[data-commentid], [role="article"][aria-label^="Comment by"]'))
       .map(extractComment)
@@ -666,7 +836,23 @@ FEED_CARDS_FROM_PAGE_SCRIPT = """
       rawParts.find((part) => /^\\d+\\s+shares?$/i.test(part)) ||
       extractCounterNear(card, '[data-ad-rendering-role="share_button"], [aria-label="Share"]', "share");
 
-    const parts = [author, postedAt, ...storyTexts].filter(Boolean);
+    const headerTime = headerPostedAt();
+    const parts = [author, headerTime || postedAt, ...storyTexts].filter(Boolean);
+    const backgroundImages = Array.from(card.querySelectorAll('*'))
+      .map((node) => {
+        const style = window.getComputedStyle(node);
+        const bg = style.backgroundImage || "";
+        const match = bg.match(/url\\(["']?(.*?)["']?\\)/);
+        const nodeRect = node.getBoundingClientRect();
+        return match ? {
+          src: match[1],
+          alt: "",
+          width: Math.round(nodeRect.width) || null,
+          height: Math.round(nodeRect.height) || null,
+          perfLogName: "backgroundImage"
+        } : null;
+      })
+      .filter(Boolean);
     const images = Array.from(card.querySelectorAll('img'))
       .map((img) => ({
         src: img.currentSrc || img.src || null,
@@ -677,10 +863,14 @@ FEED_CARDS_FROM_PAGE_SCRIPT = """
       }))
       .filter((img) => img.src && !img.src.startsWith("data:image/svg"))
       .filter((img) => img.alt || /fbcdn|scontent/i.test(img.src || ""));
+    const allImages = [...images, ...backgroundImages].filter((img, imageIndex, arr) => {
+      const key = `${img.src}|${img.alt}`;
+      return arr.findIndex((other) => `${other.src}|${other.alt}` === key) === imageIndex;
+    });
 
     cards.push({
       author,
-      postedAt,
+      postedAt: headerTime || postedAt || visualPostedAt(),
       url: urlNode ? urlNode.href : null,
       parts,
       text: storyTexts.join("\\n").trim(),
@@ -689,7 +879,7 @@ FEED_CARDS_FROM_PAGE_SCRIPT = """
       commentCountText,
       shareCountText,
       comments,
-      images,
+      images: allImages,
       top: rect.top,
       left: rect.left
     });
@@ -737,6 +927,108 @@ SELECT_ALL_COMMENTS_SORT_SCRIPT = """
     .filter((node) => {
       const text = clean(node.textContent);
       return /^All comments$/i.test(text) || /^All comments\\s+/i.test(text);
+    })
+    .filter(visible)
+    .filter((node) => {
+      const rect = node.getBoundingClientRect();
+      return rect.width < 700 && rect.height < 180;
+    });
+  const option = candidates[candidates.length - 1];
+  if (!option) return false;
+  option.click();
+  return true;
+}
+"""
+
+OPEN_RELEVANT_COMMENTS_SORT_SCRIPT = """
+() => {
+  const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
+  const visible = (node) => {
+    const rect = node.getBoundingClientRect();
+    const style = window.getComputedStyle(node);
+    return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+  };
+  const labels = ["Most relevant", "Newest", "All comments"];
+  const matchingLabel = (text) => labels.find((label) => text === label || text.startsWith(`${label} `));
+  const candidates = Array.from(document.querySelectorAll('span, div, [role="button"]'))
+    .filter((node) => matchingLabel(clean(node.textContent)))
+    .filter(visible)
+    .filter((node) => {
+      const rect = node.getBoundingClientRect();
+      return rect.width < 600 && rect.height < 120;
+    });
+  const trigger = candidates[candidates.length - 1];
+  if (!trigger) return "not_found";
+  const current = matchingLabel(clean(trigger.textContent));
+  if (/^Most relevant$/i.test(current)) return "already_relevant_comments";
+  trigger.click();
+  return `opened_${current}`;
+}
+"""
+
+SELECT_RELEVANT_COMMENTS_SORT_SCRIPT = """
+() => {
+  const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
+  const visible = (node) => {
+    const rect = node.getBoundingClientRect();
+    const style = window.getComputedStyle(node);
+    return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+  };
+  const candidates = Array.from(document.querySelectorAll('span, div, [role="menuitem"], [role="option"]'))
+    .filter((node) => {
+      const text = clean(node.textContent);
+      return /^Most relevant$/i.test(text) || /^Most relevant\\s+/i.test(text);
+    })
+    .filter(visible)
+    .filter((node) => {
+      const rect = node.getBoundingClientRect();
+      return rect.width < 700 && rect.height < 180;
+    });
+  const option = candidates[candidates.length - 1];
+  if (!option) return false;
+  option.click();
+  return true;
+}
+"""
+
+OPEN_NEW_POSTS_SORT_SCRIPT = """
+() => {
+  const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
+  const visible = (node) => {
+    const rect = node.getBoundingClientRect();
+    const style = window.getComputedStyle(node);
+    return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+  };
+  const labels = ["Most relevant", "Recent activity", "New posts"];
+  const matchingLabel = (text) => labels.find((label) => text === label || text.startsWith(`${label} `));
+  const candidates = Array.from(document.querySelectorAll('span, div, [role="button"]'))
+    .filter((node) => matchingLabel(clean(node.textContent)))
+    .filter(visible)
+    .filter((node) => {
+      const rect = node.getBoundingClientRect();
+      return rect.width < 700 && rect.height < 160;
+    });
+  const trigger = candidates[candidates.length - 1];
+  if (!trigger) return "not_found";
+  const current = matchingLabel(clean(trigger.textContent));
+  if (/^New posts$/i.test(current)) return "already_new_posts";
+  trigger.click();
+  return `opened_${current}`;
+}
+"""
+
+SELECT_NEW_POSTS_SORT_SCRIPT = """
+() => {
+  const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
+  const visible = (node) => {
+    const rect = node.getBoundingClientRect();
+    const style = window.getComputedStyle(node);
+    return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+  };
+  const candidates = Array.from(document.querySelectorAll('span, div, [role="menuitem"], [role="option"]'))
+    .filter((node) => {
+      const text = clean(node.textContent);
+      return /^New posts$/i.test(text) || /^New posts\\s+/i.test(text);
     })
     .filter(visible)
     .filter((node) => {
@@ -836,10 +1128,22 @@ def parse_args() -> argparse.Namespace:
         help="Maximum comments/replies per post. Use 0 for no scraper-side limit.",
     )
     parser.add_argument(
+        "--max-subcomments",
+        type=int,
+        default=int(os.getenv("MAX_SUBCOMMENTS_PER_COMMENT", "3")),
+        help="Maximum replies/subcomments to keep under each parent comment.",
+    )
+    parser.add_argument(
         "--comment-expand-rounds",
         type=int,
-        default=int(os.getenv("COMMENT_EXPAND_ROUNDS", "6")),
-        help="How many times to click comment/reply expansion controls per visible post. Use 0 to expand until no more controls are found.",
+        default=int(os.getenv("COMMENT_EXPAND_ROUNDS", "1")),
+        help="How many times to click comment/reply expansion controls per visible post. Use 0 to avoid expansion in fast mode.",
+    )
+    parser.add_argument(
+        "--comment-sort",
+        choices=("relevant", "all"),
+        default=os.getenv("COMMENT_SORT", "relevant").lower(),
+        help="Use Facebook's relevant comments for speed, or all comments for exhaustive scraping.",
     )
     parser.add_argument(
         "--scrolls",
@@ -860,6 +1164,29 @@ def parse_args() -> argparse.Namespace:
         "--extra-post-urls",
         default=os.getenv("EXTRA_POST_URLS", ""),
         help="Comma/newline-separated Facebook post or permalink URLs to include.",
+    )
+    parser.add_argument(
+        "--parallel-workers",
+        type=int,
+        default=int(os.getenv("PARALLEL_WORKERS", "1")),
+        help="Number of post permalink pages to scrape in parallel. Keep this low; 2-4 is usually safest.",
+    )
+    parser.add_argument(
+        "--parallel-profile-dirs",
+        default=os.getenv("PARALLEL_PROFILE_DIRS", ""),
+        help="Comma/newline-separated browser profile directories for true parallel scraping. Each profile must already be logged into Facebook.",
+    )
+    parser.add_argument(
+        "--today-only",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("TODAY_ONLY", True),
+        help="Stop scanning the New posts feed once a Yesterday/older post is reached.",
+    )
+    parser.add_argument(
+        "--recover-urls",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("RECOVER_URLS", False),
+        help="Try slower click/HTML recovery for feed posts that do not expose permalinks.",
     )
     return parser.parse_args()
 
@@ -954,6 +1281,38 @@ def parse_extra_post_urls(value: str, group_id: str) -> list[str]:
     return urls
 
 
+def parse_profile_dirs(value: str, base_dir: Path) -> list[Path]:
+    profiles: list[Path] = []
+    seen: set[Path] = set()
+    for item in re.split(r"[\n,]+", value or ""):
+        item = item.strip()
+        if not item:
+            continue
+        path = Path(item)
+        if not path.is_absolute():
+            path = base_dir / path
+        path = path.resolve()
+        if path in seen:
+            continue
+        seen.add(path)
+        profiles.append(path)
+    return profiles
+
+
+def warn_if_profile_locked(profile_dir: Path) -> None:
+    lock_paths = [
+        profile_dir / "SingletonLock",
+        profile_dir / "SingletonSocket",
+        profile_dir / "SingletonCookie",
+    ]
+    existing = [path.name for path in lock_paths if path.exists()]
+    if existing:
+        print(
+            f"Profile {profile_dir} has active Chromium lock files ({', '.join(existing)}). "
+            "Avoid running two jobs with the same profile at the same time."
+        )
+
+
 def merge_urls(*url_groups: list[str]) -> list[str]:
     merged: list[str] = []
     seen: set[str] = set()
@@ -1010,11 +1369,12 @@ def recover_visible_post_url(
         needle = (text or author or "").strip()
         if needle and needle in html:
             index = html.find(needle)
-            blobs.append(html[max(0, index - 80_000): index + 80_000])
+            blobs.append(html[max(0, index - 180_000): index + 180_000])
         elif author and author in html:
             index = html.find(author)
-            blobs.append(html[max(0, index - 80_000): index + 80_000])
-        blobs.append(html)
+            blobs.append(html[max(0, index - 180_000): index + 180_000])
+        if len(html) < 3_000_000:
+            blobs.append(html)
     except Exception:
         pass
 
@@ -1022,6 +1382,43 @@ def recover_visible_post_url(
         urls = post_urls_from_blob(blob, group_id)
         if urls:
             return urls[0]
+    return None
+
+
+def recover_visible_post_url_by_time_click(
+    page: Page,
+    group_id: str,
+    group_url: str,
+    left: object,
+    top: object,
+) -> str | None:
+    try:
+        x = int(float(left)) + 60
+        y = int(float(top)) + 34
+    except (TypeError, ValueError):
+        return None
+
+    before_url = page.url
+    try:
+        page.mouse.click(x, y)
+        page.wait_for_timeout(2_500)
+        url = normalize_post_url(page.url, group_id)
+        if url:
+            safe_goto(page, group_url)
+            page.wait_for_timeout(2_000)
+            set_feed_sort_recent(page)
+            return url
+        if page.url != before_url:
+            safe_goto(page, group_url)
+            page.wait_for_timeout(2_000)
+            set_feed_sort_recent(page)
+    except Exception:
+        try:
+            safe_goto(page, group_url)
+            page.wait_for_timeout(1_000)
+            set_feed_sort_recent(page)
+        except Exception:
+            pass
     return None
 
 
@@ -1043,22 +1440,53 @@ def prefill_login_email(page: Page, email: str | None) -> None:
         print("Could not find a visible Facebook email field to prefill.")
 
 
+def safe_goto(
+    page: Page,
+    url: str,
+    wait_until: str = "domcontentloaded",
+    timeout: int = 90_000,
+    retries: int = 2,
+) -> bool:
+    for attempt in range(retries + 1):
+        try:
+            page.goto(url, wait_until=wait_until, timeout=timeout)
+            return True
+        except Exception as exc:
+            print(f"Navigation attempt {attempt + 1}/{retries + 1} failed for {url}: {exc}")
+            if attempt >= retries:
+                try:
+                    page.goto(url, wait_until="commit", timeout=30_000)
+                    page.wait_for_timeout(5_000)
+                    return True
+                except Exception as fallback_exc:
+                    print(f"Fallback navigation failed for {url}: {fallback_exc}")
+                    return False
+            page.wait_for_timeout(3_000)
+    return False
+
+
 def click_visible_buttons(page: Page, patterns: list[str], max_clicks: int = 10) -> int:
     clicked = 0
     for pattern in patterns:
-        buttons = page.get_by_role("button", name=pattern)
-        for index in range(min(buttons.count(), max_clicks - clicked)):
-            try:
-                button = buttons.nth(index)
-                if button.is_visible(timeout=500):
-                    button.click(timeout=1_000)
-                    clicked += 1
-                    page.wait_for_timeout(600)
-            except Exception:
-                continue
+        regex = re.compile(pattern, re.IGNORECASE)
+        candidates = [
+            page.get_by_role("button", name=regex),
+            page.get_by_text(regex),
+            page.locator("span, div, a").filter(has_text=regex),
+        ]
+        for buttons in candidates:
+            for index in range(min(buttons.count(), max_clicks - clicked)):
+                try:
+                    button = buttons.nth(index)
+                    if button.is_visible(timeout=500):
+                        button.click(timeout=1_000)
+                        clicked += 1
+                        page.wait_for_timeout(600)
+                except Exception:
+                    continue
 
-            if clicked >= max_clicks:
-                return clicked
+                if clicked >= max_clicks:
+                    return clicked
     return clicked
 
 
@@ -1098,6 +1526,20 @@ def click_first_visible(locator: Locator, timeout: int = 1_000, from_last: bool 
 
 
 def set_feed_sort_recent(page: Page) -> None:
+    try:
+        state = page.evaluate(OPEN_NEW_POSTS_SORT_SCRIPT)
+        if state == "already_new_posts":
+            print("Feed sort already set to New posts.")
+            return
+        if state and state.startswith("opened_"):
+            page.wait_for_timeout(700)
+            if page.evaluate(SELECT_NEW_POSTS_SORT_SCRIPT):
+                page.wait_for_timeout(2_000)
+                print("Feed sort set to New posts.")
+                return
+    except Exception:
+        pass
+
     sort_labels = re.compile(r"^(Most relevant|Recent activity|New posts)$", re.IGNORECASE)
     try:
         clicked = click_first_visible(page.get_by_text(sort_labels), timeout=3_000, from_last=True)
@@ -1106,16 +1548,15 @@ def set_feed_sort_recent(page: Page) -> None:
     except Exception:
         pass
 
-    for label in ("New posts", "Recent activity"):
-        try:
-            if click_first_visible(page.get_by_text(label, exact=True), timeout=3_000, from_last=True):
-                page.wait_for_timeout(2_000)
-                print(f"Feed sort set to {label}.")
-                return
-        except Exception:
-            pass
+    try:
+        if click_first_visible(page.get_by_text("New posts", exact=True), timeout=3_000, from_last=True):
+            page.wait_for_timeout(2_000)
+            print("Feed sort set to New posts.")
+            return
+    except Exception:
+        pass
 
-    print("Could not switch feed sort. Continuing with the current Facebook sort.")
+    print("Could not switch feed sort to New posts. Continuing with chronological URL sort.")
 
 
 def close_floating_popups(page: Page) -> None:
@@ -1142,6 +1583,58 @@ def expand_visible_content(page: Page) -> int:
         ],
         max_clicks=12,
     )
+
+
+def expand_visible_post_bodies(page: Page, max_clicks: int = 8) -> int:
+    """Expand visible post body truncation without touching comment controls."""
+    clicked = 0
+    selectors = [
+        '[data-ad-rendering-role="story_message"] div[role="button"]:has-text("See more")',
+        '[data-ad-rendering-role="story_message"] span[role="button"]:has-text("See more")',
+        '[data-ad-rendering-role="story_message"] div:text-is("See more")',
+        '[data-ad-rendering-role="story_message"] span:text-is("See more")',
+    ]
+    for selector in selectors:
+        controls = page.locator(selector)
+        count = min(controls.count(), max_clicks - clicked)
+        for index in range(count):
+            try:
+                control = controls.nth(index)
+                if control.is_visible(timeout=500):
+                    control.scroll_into_view_if_needed(timeout=1_000)
+                    control.click(timeout=1_500)
+                    clicked += 1
+                    page.wait_for_timeout(400)
+            except Exception:
+                continue
+            if clicked >= max_clicks:
+                return clicked
+    return clicked
+
+
+def expand_article_post_body(article: Locator, max_clicks: int = 2) -> int:
+    clicked = 0
+    selectors = [
+        '[data-ad-rendering-role="story_message"] div[role="button"]:has-text("See more")',
+        '[data-ad-rendering-role="story_message"] span[role="button"]:has-text("See more")',
+        '[data-ad-rendering-role="story_message"] div:text-is("See more")',
+        '[data-ad-rendering-role="story_message"] span:text-is("See more")',
+    ]
+    for selector in selectors:
+        controls = article.locator(selector)
+        count = min(controls.count(), max_clicks - clicked)
+        for index in range(count):
+            try:
+                control = controls.nth(index)
+                if control.is_visible(timeout=500):
+                    control.scroll_into_view_if_needed(timeout=1_000)
+                    control.click(timeout=1_500)
+                    clicked += 1
+            except Exception:
+                continue
+            if clicked >= max_clicks:
+                return clicked
+    return clicked
 
 
 def set_comments_sort_all(page: Page) -> None:
@@ -1188,6 +1681,39 @@ def set_comments_sort_all(page: Page) -> None:
             return
 
 
+def set_comments_sort_relevant(page: Page) -> None:
+    try:
+        state = page.evaluate(OPEN_RELEVANT_COMMENTS_SORT_SCRIPT)
+        if state == "already_relevant_comments":
+            print("Comments sort already set to Most relevant.")
+            return
+        if state and state.startswith("opened_"):
+            page.wait_for_timeout(500)
+            if page.evaluate(SELECT_RELEVANT_COMMENTS_SORT_SCRIPT):
+                page.wait_for_timeout(800)
+                print("Comments sort set to Most relevant.")
+                return
+    except Exception:
+        pass
+
+    sort_label = re.compile(r"^(Most relevant|Newest|All comments)$", re.IGNORECASE)
+    try:
+        if click_first_visible(page.get_by_text(sort_label), timeout=2_000, from_last=True):
+            page.wait_for_timeout(500)
+            if click_first_visible(page.get_by_text("Most relevant", exact=True), timeout=2_000, from_last=True):
+                page.wait_for_timeout(800)
+                print("Comments sort set to Most relevant.")
+    except Exception:
+        pass
+
+
+def set_comments_sort(page: Page, comment_sort: str) -> None:
+    if comment_sort == "all":
+        set_comments_sort_all(page)
+    else:
+        set_comments_sort_relevant(page)
+
+
 def scroll_comments_down(page: Page) -> dict[str, int]:
     try:
         return page.evaluate(
@@ -1216,21 +1742,23 @@ def scroll_comments_down(page: Page) -> dict[str, int]:
         return {"beforeY": 0, "afterY": 0, "beforeHeight": 0, "afterHeight": 0}
 
 
-def expand_post_page_comments(page: Page, rounds: int) -> None:
-    set_comments_sort_all(page)
-    max_rounds = rounds if rounds > 0 else 100
+def expand_post_page_comments(page: Page, rounds: int, comment_sort: str = "relevant") -> None:
+    set_comments_sort(page, comment_sort)
+    max_rounds = max(0, rounds)
     idle_rounds = 0
     for round_index in range(max_rounds):
         clicked = expand_visible_content(page)
         if round_index == 0 or round_index % 3 == 2:
-            set_comments_sort_all(page)
+            set_comments_sort(page, comment_sort)
         clicked += click_visible_buttons(
             page,
             [
-                "View more comments",
-                "View previous comments",
-                "View more replies",
-                "See more",
+                r"View more comments",
+                r"View previous comments",
+                r"View more replies",
+                r"View \d+ more repl",
+                r"\d+\s+repl",
+                r"See more",
             ],
             max_clicks=20,
         )
@@ -1293,11 +1821,13 @@ def expand_article_comments(page: Page, article: Locator, rounds: int) -> None:
 
 
 def comment_key(comment: dict[str, str | None]) -> str:
+    text = str(comment.get("text") or "")
+    text = re.sub(r"^(?:Â·|·)\s*", "", text).strip()
     return "|".join(
         [
             comment.get("author") or "",
             comment.get("posted_at") or "",
-            comment.get("text") or "",
+            text,
         ]
     )
 
@@ -1318,6 +1848,56 @@ def merge_comment_lists(
         if max_comments > 0 and len(merged) >= max_comments:
             break
     return merged
+
+
+def strip_comment_internals(comment: dict[str, object]) -> dict[str, object]:
+    return {key: value for key, value in comment.items() if not str(key).startswith("_") and key not in {"subcomments", "subcomments_found"}}
+
+
+def count_nested_subcomments(comments: list[dict[str, object]]) -> int:
+    total = 0
+    for comment in comments:
+        subcomments = comment.get("subcomments") if isinstance(comment, dict) else None
+        if isinstance(subcomments, list):
+            total += len(subcomments)
+            total += count_nested_subcomments([item for item in subcomments if isinstance(item, dict)])
+    return total
+
+
+def nest_subcomments(comments: list[dict[str, object]], max_subcomments: int) -> list[dict[str, object]]:
+    if max_subcomments <= 0:
+        return [strip_comment_internals(comment) for comment in comments]
+
+    left_values = [
+        int(comment.get("_left") or 0)
+        for comment in comments
+        if isinstance(comment.get("_left"), int) and int(comment.get("_left") or 0) > 0
+    ]
+    baseline_left = min(left_values) if left_values else 0
+    nested: list[dict[str, object]] = []
+    current_parent: dict[str, object] | None = None
+
+    for comment in comments:
+        left = int(comment.get("_left") or baseline_left or 0)
+        is_reply = bool(baseline_left and left > baseline_left + 24 and current_parent is not None)
+        if is_reply:
+            replies = current_parent.setdefault("subcomments", [])
+            if isinstance(replies, list) and len(replies) < max_subcomments:
+                replies.append(strip_comment_internals(comment))
+            continue
+
+        parent = dict(comment)
+        parent.setdefault("subcomments", [])
+        nested.append(parent)
+        current_parent = parent
+
+    return [strip_comment_internals(comment) for comment in nested]
+
+
+def limit_parent_comments(comments: list[dict[str, object]], max_comments: int) -> list[dict[str, object]]:
+    if max_comments <= 0:
+        return comments
+    return comments[:max_comments]
 
 
 def better_count_text(current: str | None, candidate: str | None) -> str | None:
@@ -1348,27 +1928,31 @@ def collect_comments_while_expanding(
     page: Page,
     max_comments: int,
     rounds: int,
+    comment_sort: str = "relevant",
 ) -> list[dict[str, str | None]]:
     comments: list[dict[str, str | None]] = []
-    set_comments_sort_all(page)
-    max_rounds = rounds if rounds > 0 else 100
+    set_comments_sort(page, comment_sort)
+    max_rounds = max(0, rounds)
     idle_rounds = 0
 
-    for round_index in range(max_rounds):
-        comments = merge_comment_lists(comments, extract_comments_from_page(page, max_comments), max_comments)
-        if max_comments > 0 and len(comments) >= max_comments:
-            break
+    comments = merge_comment_lists(comments, extract_comments_from_page(page, max_comments), max_comments)
+    if max_comments > 0 and len(comments) >= max_comments:
+        print(f"Progressive comment scan collected {len(comments)} unique rows.")
+        return comments
 
+    for round_index in range(max_rounds):
         clicked = expand_visible_content(page)
         if round_index == 0 or round_index % 3 == 2:
-            set_comments_sort_all(page)
+            set_comments_sort(page, comment_sort)
         clicked += click_visible_buttons(
             page,
             [
-                "View more comments",
-                "View previous comments",
-                "View more replies",
-                "See more",
+                r"View more comments",
+                r"View previous comments",
+                r"View more replies",
+                r"View \d+ more repl",
+                r"\d+\s+repl",
+                r"See more",
             ],
             max_clicks=20,
         )
@@ -1435,7 +2019,7 @@ def parse_comment_aria_label(aria_label: str) -> tuple[str | None, str | None]:
 def clean_comment_text(text: str, author: str | None, posted_at: str | None) -> str:
     cleaned_lines: list[str] = []
     for line in (text or "").splitlines():
-        value = re.sub(r"\b(Like|Reply|Share)\b", " ", line, flags=re.IGNORECASE)
+        value = re.sub(r"\b(Like|Reply|Share|Follow|Following|See translation)\b", " ", line, flags=re.IGNORECASE)
         value = re.sub(r"\s+", " ", value).strip()
         if not value:
             continue
@@ -1456,7 +2040,29 @@ def clean_comment_text(text: str, author: str | None, posted_at: str | None) -> 
         cleaned = cleaned[len(author) :].strip()
     if posted_at and cleaned.endswith(posted_at):
         cleaned = cleaned[: -len(posted_at)].strip()
+    cleaned = re.sub(r"^(?:Â·|·)\s*", "", cleaned).strip()
     return cleaned
+
+
+def clean_comment_author(author: object) -> str | None:
+    value = re.sub(r"\s+", " ", str(author or "")).strip()
+    if not value:
+        return None
+    value = re.sub(r"\s+about$", "", value, flags=re.IGNORECASE).strip()
+    if COMMENT_TIME_PATTERN.match(value):
+        return None
+    if re.match(r"^(Like|Reply|Share|Comment|Follow|Following|See translation)$", value, re.IGNORECASE):
+        return None
+    return value or None
+
+
+def clean_comment_payload(details: dict[str, object]) -> tuple[str | None, str | None, str]:
+    author = clean_comment_author(details.get("author"))
+    posted_at = str(details.get("postedAt") or "").strip() or None
+    text = clean_comment_text(str(details.get("text") or "").strip(), author, posted_at)
+    if author:
+        text = re.sub(rf"^{re.escape(author)}\s*", "", text).strip()
+    return author, posted_at, text
 
 
 def is_nested_article(article: Locator) -> bool:
@@ -1658,6 +2264,149 @@ def extract_owner_post_text_from_page_text(page_text: str) -> str:
     return text
 
 
+def extract_owner_post_summary_from_page_text(page_text: str) -> dict[str, str | None]:
+    post_marker = re.search(r"'s post\b", page_text)
+    empty = {"text": None, "reactions_text": None, "comment_count_text": None, "share_count_text": None}
+    if not post_marker:
+        return empty
+
+    owner = re.sub(r"\s+", " ", page_text[max(0, post_marker.start() - 140):post_marker.start()]).strip()
+    for marker in ("Create group chat", "Group chats", "Contacts", "Facebook"):
+        if marker in owner:
+            owner = owner.rsplit(marker, 1)[-1].strip()
+    owner = owner[-80:].strip()
+    if not owner:
+        return empty
+
+    sep = f"(?:{re.escape('·')}|{re.escape('Â·')})"
+    count_pattern = re.compile(
+        rf"\bGold Now\s+{re.escape(owner)}\s+{sep}.+?{sep}\s+(.+?)(?:\s+See translation\b)?\s+(\d+(?:[,.]\d+)*)\s+(\d+(?:[,.]\d+)*)\s+(?:Most relevant|All comments)\b",
+        re.DOTALL,
+    )
+    match = count_pattern.search(page_text)
+    if match:
+        text = re.sub(r"\s+", " ", match.group(1)).strip()
+        text = re.sub(r"\b(?:Like|Reply|Share|Comment|Follow|Following)\b.*$", "", text).strip()
+        text = re.sub(r"\s+\d+\s+\d+\s*$", "", text).strip()
+        return {
+            "text": text,
+            "reactions_text": f"{match.group(2).replace(',', '')} reactions",
+            "comment_count_text": f"{match.group(3).replace(',', '')} comments",
+            "share_count_text": None,
+        }
+
+    text_pattern = re.compile(
+        rf"\bGold Now\s+{re.escape(owner)}\s+{sep}.+?{sep}\s+(.+?)(?:\s+See translation\b|\s+\d+\s+\d+\s+(?:Most relevant|All comments)\b|\s+(?:Most relevant|All comments)\b)",
+        re.DOTALL,
+    )
+    text_match = text_pattern.search(page_text)
+    if not text_match:
+        return empty
+    text = re.sub(r"\s+", " ", text_match.group(1)).strip()
+    text = re.sub(r"\b(?:Like|Reply|Share|Comment|Follow|Following)\b.*$", "", text).strip()
+    text = re.sub(r"\s+\d+\s+\d+\s*$", "", text).strip()
+    return {"text": text, "reactions_text": None, "comment_count_text": None, "share_count_text": None}
+
+
+def extract_owner_post_text_from_page_text(page_text: str) -> str:
+    return extract_owner_post_summary_from_page_text(page_text).get("text") or ""
+
+
+def extract_owner_post_summary_from_page_text(page_text: str) -> dict[str, str | None]:
+    empty = {
+        "author": None,
+        "posted_at": None,
+        "text": None,
+        "reactions_text": None,
+        "comment_count_text": None,
+        "share_count_text": None,
+    }
+    post_marker = re.search(r"'s post\b", page_text)
+    if not post_marker:
+        return empty
+
+    owner = re.sub(r"\s+", " ", page_text[max(0, post_marker.start() - 140):post_marker.start()]).strip()
+    for marker in ("Create group chat", "Group chats", "Contacts", "Facebook"):
+        if marker in owner:
+            owner = owner.rsplit(marker, 1)[-1].strip()
+    owner = owner[-80:].strip()
+    if not owner:
+        return empty
+
+    result = dict(empty)
+    result["author"] = owner
+    dot = chr(0x00B7)
+    mojibake_dot = chr(0x00C2) + chr(0x00B7)
+    sep = f"(?:{re.escape(dot)}|{re.escape(mojibake_dot)})"
+
+    def clean_owner_text(value: str) -> str:
+        value = re.sub(r"\s+", " ", value).strip()
+        value = re.sub(r"\b(?:Like|Reply|Share|Comment|Follow|Following)\b.*$", "", value).strip()
+        return re.sub(r"\s+\d+\s+\d+\s*$", "", value).strip()
+
+    def posted_at_from_meta(meta: str) -> str | None:
+        meta = re.sub(r"\s+", " ", meta).strip()
+        match = re.search(r"\b(Just now|Yesterday|\d+\s*(?:m|h|d|w|mo|y))\b", meta, re.IGNORECASE)
+        return match.group(1).replace(" ", "") if match else None
+
+    count_pattern = re.compile(
+        rf"\bGold Now\s+{re.escape(owner)}\s+{sep}\s+(.+?){sep}\s+(.+?)(?:\s+See translation\b)?\s+(\d+(?:[,.]\d+)*)\s+(\d+(?:[,.]\d+)*)\s+(?:Most relevant|All comments)\b",
+        re.DOTALL,
+    )
+    match = count_pattern.search(page_text)
+    if match:
+        result["posted_at"] = posted_at_from_meta(match.group(1))
+        result["text"] = clean_owner_text(match.group(2))
+        result["reactions_text"] = f"{match.group(3).replace(',', '')} reactions"
+        result["comment_count_text"] = f"{match.group(4).replace(',', '')} comments"
+        return result
+
+    text_pattern = re.compile(
+        rf"\bGold Now\s+{re.escape(owner)}\s+{sep}\s+(.+?){sep}\s+(.+?)(?:\s+See translation\b|\s+\d+\s+\d+\s+(?:Most relevant|All comments)\b|\s+(?:Most relevant|All comments)\b)",
+        re.DOTALL,
+    )
+    text_match = text_pattern.search(page_text)
+    if text_match:
+        result["posted_at"] = posted_at_from_meta(text_match.group(1))
+        result["text"] = clean_owner_text(text_match.group(2))
+    return result
+
+
+def extract_owner_post_text_from_page_text(page_text: str) -> str:
+    return extract_owner_post_summary_from_page_text(page_text).get("text") or ""
+
+
+def strip_spaced_noise_prefix(value: str) -> str:
+    text = re.sub(r"\s+", " ", value or "").strip()
+    if not text:
+        return ""
+
+    separator_match = re.search(r"\s*(?:Â·|·|\u00b7)\s*", text)
+    if not separator_match:
+        return text
+
+    prefix = text[: separator_match.start()].strip()
+    suffix = text[separator_match.end() :].strip()
+    tokens = prefix.split()
+    if not suffix or len(tokens) < 12:
+        return text
+
+    short_noise_tokens = [
+        token
+        for token in tokens
+        if re.fullmatch(r"[A-Za-z0-9]", token) or re.fullmatch(r"\d{1,2}", token)
+    ]
+    if len(short_noise_tokens) / max(1, len(tokens)) >= 0.85:
+        return suffix
+    return text
+
+
+def clean_post_body_text(value: str | None) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = strip_spaced_noise_prefix(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def clean_post_details(details: dict[str, str | None]) -> dict[str, str | None]:
     raw_text = details.get("raw_text") or ""
     author = (details.get("author") or "").strip() or None
@@ -1676,7 +2425,7 @@ def clean_post_details(details: dict[str, str | None]) -> dict[str, str | None]:
         text = text.replace(posted_at, " ")
 
     text = re.sub(r"\b(Like|Reply|Share|Comment|Send|Follow|Following)\b", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
+    text = clean_post_body_text(text)
 
     return {
         "author": author,
@@ -1854,7 +2603,7 @@ def collect_post_urls_from_group_surfaces(
 
     for label, url in surfaces:
         print(f"Scanning {label} group surface: {url}")
-        page.goto(url, wait_until="domcontentloaded")
+        safe_goto(page, url)
         page.wait_for_timeout(3_000)
         if label == "desktop":
             set_feed_sort_recent(page)
@@ -1885,20 +2634,56 @@ def collect_post_urls_from_group_surfaces(
     return found
 
 
+def expand_post_body_see_more(page: Page) -> None:
+    """Click the 'See more' button that expands the main post body text."""
+    selectors = [
+        '[data-ad-rendering-role="story_message"] div[role="button"]:has-text("See more")',
+        '[data-ad-rendering-role="story_message"] span[role="button"]:has-text("See more")',
+        '[data-ad-rendering-role="story_message"] div:text-is("See more")',
+        '[data-ad-rendering-role="story_message"] span:text-is("See more")',
+    ]
+    for sel in selectors:
+        try:
+            btn = page.locator(sel).first
+            if btn.is_visible(timeout=800):
+                btn.click(timeout=1_500)
+                page.wait_for_timeout(600)
+                return
+        except Exception:
+            continue
+    # Fallback: any exact "See more" inside the first non-comment article
+    try:
+        articles = page.locator("div[role='article']")
+        for i in range(min(articles.count(), 3)):
+            article = articles.nth(i)
+            btn = article.get_by_text("See more", exact=True).first
+            if btn.is_visible(timeout=400):
+                btn.click(timeout=1_500)
+                page.wait_for_timeout(600)
+                return
+    except Exception:
+        pass
+
+
 def scrape_post_page(
     page: Page,
     post_url: str,
     max_comments: int,
+    max_subcomments: int,
     comment_expand_rounds: int,
     debug_dir: str,
+    comment_sort: str = "relevant",
 ) -> Post | None:
     print(f"Opening post: {post_url}")
-    page.goto(post_url, wait_until="domcontentloaded")
+    safe_goto(page, post_url)
     page.wait_for_timeout(3_000)
+    expand_post_body_see_more(page)
+    raw_comment_limit = max_comments * (max_subcomments + 1) if max_comments > 0 and max_subcomments > 0 else max_comments
     progressive_comments = collect_comments_while_expanding(
         page,
-        max_comments,
+        raw_comment_limit,
         comment_expand_rounds,
+        comment_sort,
     )
 
     top_articles = [
@@ -1910,18 +2695,31 @@ def scrape_post_page(
         if is_nested_article(article) or is_comment_article(article):
             continue
 
-        expand_article_comments(page, article, comment_expand_rounds)
+        if comment_expand_rounds > 0:
+            expand_article_comments(page, article, comment_expand_rounds)
         details = extract_post_details(article)
         text_parts = extract_text_parts(article)
         details = enrich_details_from_parts(details, text_parts)
         engagement = extract_engagement_text(page, article)
         details["url"] = post_url
+        page_text = text_from(page.locator("body"))
+        owner_summary = extract_owner_post_summary_from_page_text(page_text)
+        if owner_summary.get("author"):
+            details["author"] = owner_summary["author"]
+        if owner_summary.get("posted_at"):
+            details["posted_at"] = owner_summary["posted_at"]
+        if owner_summary.get("text"):
+            details["text"] = owner_summary["text"]
+        for key in ("reactions_text", "comment_count_text", "share_count_text"):
+            if owner_summary.get(key):
+                engagement[key] = owner_summary[key]
         if len(details["text"] or details["raw_text"] or "") < 3:
             continue
 
-        comments = merge_comment_lists(progressive_comments, extract_comments(article, max_comments), max_comments)
-        page_comments = extract_comments_from_page(page, max_comments)
-        comments = merge_comment_lists(comments, page_comments, max_comments)
+        comments = merge_comment_lists(progressive_comments, extract_comments(article, raw_comment_limit), raw_comment_limit)
+        page_comments = extract_comments_from_page(page, raw_comment_limit)
+        comments = merge_comment_lists(comments, page_comments, raw_comment_limit)
+        comments = limit_parent_comments(nest_subcomments(comments, max_subcomments), max_comments)
 
         post = Post(
             id=make_post_id(details),
@@ -1937,16 +2735,17 @@ def scrape_post_page(
             comments=comments,
             images=extract_images(article),
         )
-        if not post.comments:
+        if not post.comments and parse_count_text(post.comment_count_text):
             print("No comments found on desktop post page. Trying mobile post page.")
-            page.goto(mobile_url(post_url), wait_until="domcontentloaded")
+            safe_goto(page, mobile_url(post_url))
             page.wait_for_timeout(3_000)
             mobile_rounds = max(3, comment_expand_rounds // 2) if comment_expand_rounds > 0 else 0
             post.comments = merge_comment_lists(
                 post.comments,
-                collect_comments_while_expanding(page, max_comments, mobile_rounds),
-                max_comments,
+                collect_comments_while_expanding(page, raw_comment_limit, mobile_rounds, comment_sort),
+                raw_comment_limit,
             )
+            post.comments = limit_parent_comments(nest_subcomments(post.comments, max_subcomments), max_comments)
             if not post.comments:
                 debug_paths = write_debug_files(page, debug_dir, post.id)
                 print(
@@ -1957,18 +2756,23 @@ def scrape_post_page(
 
     page_comments = merge_comment_lists(
         progressive_comments,
-        extract_comments_from_page(page, max_comments),
-        max_comments,
+        extract_comments_from_page(page, raw_comment_limit),
+        raw_comment_limit,
     )
+    page_comments = limit_parent_comments(nest_subcomments(page_comments, max_subcomments), max_comments)
     body = page.locator("body")
     page_text = text_from(body)
     fallback_post_id = post_id_from_url(post_url)
+    owner_summary = extract_owner_post_summary_from_page_text(page_text)
     fallback_text = (
-        extract_owner_post_text_from_page_text(page_text)
+        owner_summary.get("text")
         or extract_main_post_text(body, fallback_post_id)
         or extract_styled_text(body)
     )
     fallback_engagement = extract_engagement_text(page, body)
+    for key in ("reactions_text", "comment_count_text", "share_count_text"):
+        if owner_summary.get(key):
+            fallback_engagement[key] = owner_summary[key]
     debug_paths = write_debug_files(page, debug_dir, fallback_post_id)
     print(
         "Could not extract a clean main post article. "
@@ -1980,8 +2784,8 @@ def scrape_post_page(
     # giant Facebook shell dump as the final post text.
     return Post(
         id=post_id_from_url(post_url),
-        author=None,
-        posted_at=None,
+        author=owner_summary.get("author"),
+        posted_at=owner_summary.get("posted_at"),
         url=post_url,
         text=fallback_text,
         raw_text=page_text[:1200],
@@ -1999,6 +2803,7 @@ def collect_posts(
     max_posts: int,
     max_comments: int,
     comment_expand_rounds: int,
+    today_only: bool = True,
 ) -> list[Post]:
     posts: list[Post] = []
     seen: set[str] = set()
@@ -2013,6 +2818,12 @@ def collect_posts(
         details = extract_post_details(article)
         text_parts = extract_text_parts(article)
         details = enrich_details_from_parts(details, text_parts)
+        if today_only and is_yesterday_or_older_post(details.get("posted_at")):
+            print(f"Skipping older fallback row ({details.get('posted_at')}).")
+            continue
+        if details.get("url") and "comment_id=" in str(details.get("url")):
+            group_id = group_id_from_url(page.url) if "/groups/" in page.url else ""
+            details["url"] = normalize_post_url(str(details["url"]), group_id) if group_id else None
         engagement = extract_engagement_text(page, article)
         if len(details["text"] or details["raw_text"] or "") < 3:
             continue
@@ -2077,16 +2888,116 @@ def post_text_from_feed_parts(parts: list[str], author: str | None, posted_at: s
     text = " ".join(body_parts).strip()
     if author and text.startswith(author):
         text = text[len(author) :].strip()
-    return re.sub(r"\s+", " ", text)
+    return clean_post_body_text(text)
 
 
-def collect_visible_feed_posts(page: Page, max_posts: int, max_comments: int) -> list[Post]:
+def posted_at_from_text(value: str) -> str | None:
+    match = re.search(
+        r"\b(Just now|Yesterday|\d+\s*(?:m|h|d|w|mo|y))\b",
+        value or "",
+        re.IGNORECASE,
+    )
+    return match.group(1).replace(" ", "") if match else None
+
+
+def is_yesterday_or_older_post(posted_at: str | None) -> bool:
+    from datetime import datetime as _dt
+    value = " ".join((posted_at or "").split()).strip().lower()
+    if not value:
+        return False
+    if value.startswith("yesterday"):
+        return True
+    if re.match(r"^(?:a|an|\d+)\s+(?:day|week|month|year)s?\s+ago$", value):
+        return True
+    if re.match(r"^\d+\s*(?:d|w|mo|y)\b", value):
+        return True
+    # Parse absolute date strings: "May 31 at 5:49 AM", "Saturday, May 31, 2026 at 5:49 AM"
+    _months = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,"jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12}
+    m = re.search(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(\d{1,2})", value)
+    if m:
+        try:
+            month = _months[m.group(1)[:3]]
+            day = int(m.group(2))
+            yr_m = re.search(r"\b(20\d{2})\b", value)
+            year = int(yr_m.group(1)) if yr_m else _dt.now().year
+            post_date = _dt(year, month, day)
+            today_midnight = _dt.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            return post_date < today_midnight
+        except Exception:
+            return True  # if parse fails, treat as old
+    return False
+
+
+def normalize_group_url(value: str | None) -> str:
+    try:
+        group_id = group_id_from_url(value or "")
+    except Exception:
+        return (value or "").split("?")[0].rstrip("/")
+    return f"https://www.facebook.com/groups/{group_id}"
+
+
+def new_posts_heading_bottom(page: Page) -> float | None:
+    try:
+        value = page.evaluate(
+            """
+            () => {
+              const clean = (text) => (text || "").replace(/\\s+/g, " ").trim();
+              const candidates = Array.from(document.querySelectorAll('span, div, h2, h3'))
+                .filter((node) => /^New posts$/i.test(clean(node.innerText || node.textContent)))
+                .map((node) => {
+                  const rect = node.getBoundingClientRect();
+                  const style = window.getComputedStyle(node);
+                  return {
+                    bottom: rect.bottom,
+                    top: rect.top,
+                    width: rect.width,
+                    height: rect.height,
+                    visible: rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none"
+                  };
+                })
+                .filter((item) => item.visible)
+                .sort((a, b) => a.top - b.top);
+              const heading = candidates[0];
+              return heading ? heading.bottom : null;
+            }
+            """
+        )
+        return float(value) if value is not None else None
+    except Exception:
+        return None
+
+
+def collect_visible_feed_posts(
+    page: Page,
+    max_posts: int,
+    max_comments: int,
+    today_only: bool = True,
+    recover_urls: bool = False,
+) -> tuple[list[Post], bool]:
     posts: list[Post] = []
     seen: set[str] = set()
+    reached_old_posts = False
+    older_cards_seen = 0
+    old_stop_threshold = 1 if today_only else 3
+    expanded_bodies = expand_visible_post_bodies(page)
+    if expanded_bodies:
+        page.wait_for_timeout(500)
     try:
         visual_cards = page.evaluate(FEED_CARDS_FROM_PAGE_SCRIPT)
     except Exception:
         visual_cards = []
+    if today_only:
+        heading_bottom = new_posts_heading_bottom(page)
+        if heading_bottom is not None:
+            before_count = len(visual_cards)
+            visual_cards = [
+                card
+                for card in visual_cards
+                if float(card.get("top") or 0) > heading_bottom
+            ]
+            skipped = before_count - len(visual_cards)
+            if skipped:
+                print(f"Skipped {skipped} cards above the New posts feed.")
 
     group_id = group_id_from_url(page.url) if "/groups/" in page.url else ""
     for index, card in enumerate(visual_cards):
@@ -2095,17 +3006,53 @@ def collect_visible_feed_posts(page: Page, max_posts: int, max_comments: int) ->
         posted_at = card.get("postedAt")
         text = post_text_from_feed_parts(parts, author, posted_at)
         raw_text = card.get("rawText") or ""
+        if not posted_at:
+            # Only scan the post's own styled text, not raw_text which includes comment timestamps.
+            # A yesterday post with a comment from "2h ago" would otherwise appear to be recent.
+            posted_at = posted_at_from_text(card.get("text") or "")
+
+        # Use inline feed-card comments as a secondary age signal.
+        # If every visible comment in the card is from yesterday/older, the post itself is old.
+        if today_only and not is_yesterday_or_older_post(posted_at):
+            feed_comments = card.get("comments") or []
+            if feed_comments:
+                comment_times = [c.get("postedAt") or "" for c in feed_comments]
+                if all(is_yesterday_or_older_post(t) for t in comment_times if t):
+                    posted_at = posted_at or "1d"  # signal old to stop-logic below
+
+        if today_only and is_yesterday_or_older_post(posted_at):
+            older_cards_seen += 1
+            print(f"Skipping older post card ({posted_at}) during today-only feed scan.")
+            if older_cards_seen >= old_stop_threshold:
+                print(f"Reached {older_cards_seen} older post cards; stopping today-only feed scan.")
+                reached_old_posts = True
+                break
+            continue
+        if today_only and not posted_at and older_cards_seen > 0:
+            # Past the old-post boundary — null-time posts here are likely old bumped posts.
+            continue
+        older_cards_seen = 0
 
         if not text and not raw_text:
             continue
 
-        url = recover_visible_post_url(
-            page,
-            group_id,
-            card.get("url"),
-            card.get("text") or text or raw_text,
-            author,
-        ) if group_id else None
+        url = normalize_post_url(card.get("url") or "", group_id) if group_id else None
+        if recover_urls and not url and group_id:
+            url = recover_visible_post_url(
+                page,
+                group_id,
+                card.get("url"),
+                card.get("text") or text or raw_text,
+                author,
+            )
+        if recover_urls and not url and group_id:
+            url = recover_visible_post_url_by_time_click(
+                page,
+                group_id,
+                page.url,
+                card.get("left"),
+                card.get("top"),
+            )
         post_id = post_id_from_url(url) if url else make_feed_post_id(author, posted_at, text or raw_text, index)
         if post_id in seen:
             continue
@@ -2148,14 +3095,20 @@ def collect_visible_feed_posts(page: Page, max_posts: int, max_comments: int) ->
             )
         )
         if len(posts) >= max_posts:
-            return posts
+            return posts, reached_old_posts
 
+    # Reset the counter so the articles fallback can find image-only posts that were
+    # invisible to FEED_CARDS_FROM_PAGE_SCRIPT (no story_message element).
+    older_cards_seen = 0
     articles = page.locator("div[role='article']")
 
     for index in range(articles.count()):
         article = articles.nth(index)
         if is_nested_article(article) or is_comment_article(article):
             continue
+
+        if expand_article_post_body(article):
+            page.wait_for_timeout(300)
 
         try:
             card = article.evaluate(FEED_CARD_SCRIPT)
@@ -2167,19 +3120,43 @@ def collect_visible_feed_posts(page: Page, max_posts: int, max_comments: int) ->
         posted_at = card.get("postedAt")
         text = post_text_from_feed_parts(parts, author, posted_at)
         raw_text = card.get("rawText") or text_from(article)
+        if not posted_at:
+            posted_at = posted_at_from_text(card.get("text") or "")
+
+        if today_only and not is_yesterday_or_older_post(posted_at):
+            feed_comments = card.get("comments") or []
+            if feed_comments:
+                comment_times = [c.get("postedAt") or "" for c in feed_comments]
+                if all(is_yesterday_or_older_post(t) for t in comment_times if t):
+                    posted_at = posted_at or "1d"
+
+        if today_only and is_yesterday_or_older_post(posted_at):
+            older_cards_seen += 1
+            print(f"Skipping older post card ({posted_at}) during today-only feed scan.")
+            if older_cards_seen >= old_stop_threshold:
+                print(f"Reached {older_cards_seen} older post cards; stopping today-only feed scan.")
+                reached_old_posts = True
+                break
+            continue
+        if today_only and not posted_at and older_cards_seen > 0:
+            # Past the old-post boundary — null-time posts here are likely old bumped posts.
+            continue
+        older_cards_seen = 0
 
         if not text and not raw_text:
             continue
 
         group_id = group_id_from_url(page.url) if "/groups/" in page.url else ""
-        url = recover_visible_post_url(
-            page,
-            group_id,
-            card.get("url"),
-            text or raw_text,
-            author,
-            article,
-        ) if group_id else None
+        url = normalize_post_url(card.get("url") or "", group_id) if group_id else None
+        if recover_urls and not url and group_id:
+            url = recover_visible_post_url(
+                page,
+                group_id,
+                card.get("url"),
+                text or raw_text,
+                author,
+                article,
+            )
         post_id = post_id_from_url(url) if url else make_feed_post_id(author, posted_at, text or raw_text, index)
         if post_id in seen:
             continue
@@ -2206,7 +3183,7 @@ def collect_visible_feed_posts(page: Page, max_posts: int, max_comments: int) ->
         if len(posts) >= max_posts:
             break
 
-    return posts
+    return posts, reached_old_posts
 
 
 def collect_visible_feed_posts_over_scrolls(
@@ -2215,29 +3192,226 @@ def collect_visible_feed_posts_over_scrolls(
     max_posts: int,
     max_comments: int,
     scrolls: int,
+    today_only: bool = True,
+    recover_urls: bool = False,
 ) -> list[Post]:
-    page.goto(group_url, wait_until="domcontentloaded")
-    page.wait_for_timeout(3_000)
+    if normalize_group_url(page.url) != normalize_group_url(group_url):
+        safe_goto(page, group_url)
+    page.wait_for_timeout(1_200)
     set_feed_sort_recent(page)
 
     posts: list[Post] = []
     for scroll in range(scrolls):
         close_floating_popups(page)
-        visible_posts = collect_visible_feed_posts(page, max_posts, max_comments)
+        visible_posts, reached_old_posts = collect_visible_feed_posts(
+            page,
+            max_posts,
+            max_comments,
+            today_only,
+            recover_urls,
+        )
         posts = merge_posts(posts, visible_posts, max_posts)
         print(f"Visible feed scan {scroll + 1}/{scrolls}: collected {len(posts)} post cards")
+        if reached_old_posts:
+            print("Today-only feed scan stopped at Yesterday/older post.")
+            break
         if len(posts) >= max_posts:
             break
-        page.mouse.wheel(0, 2_500)
-        page.wait_for_timeout(1_500)
+        page.mouse.wheel(0, 3_000)
+        page.wait_for_timeout(700)
+
+    return posts
+
+
+def scrape_post_urls(
+    context,
+    first_page: Page,
+    post_urls: list[str],
+    max_comments: int,
+    max_subcomments: int,
+    comment_expand_rounds: int,
+    debug_dir: str,
+    parallel_workers: int,
+    profile_dir: Path,
+    parallel_profile_dirs: list[Path],
+    group_url: str,
+    headless: bool,
+    comment_sort: str = "relevant",
+) -> list[Post]:
+    if not post_urls:
+        return []
+
+    usable_profiles = [
+        path
+        for path in parallel_profile_dirs
+        if path.resolve() != profile_dir.resolve()
+    ]
+    worker_count = max(1, min(parallel_workers, 8, len(post_urls), len(usable_profiles) or 1))
+    if parallel_workers > 1 and not usable_profiles:
+        print(
+            "Parallel workers requested, but no separate parallel_profile_dirs were provided. "
+            "Using sequential scraping to protect result accuracy."
+        )
+        worker_count = 1
+    elif parallel_workers > 1 and len(usable_profiles) < min(parallel_workers, len(post_urls)):
+        print(
+            f"Parallel workers requested: {parallel_workers}, but only {len(usable_profiles)} separate "
+            f"parallel profiles are available. Using {worker_count} workers."
+        )
+    if worker_count == 1:
+        posts = []
+        for post_url in post_urls:
+            post = scrape_post_page(
+                first_page,
+                post_url,
+                max_comments,
+                max_subcomments,
+                comment_expand_rounds,
+                debug_dir,
+                comment_sort,
+            )
+            if post:
+                posts.append(post)
+        return posts
+
+    print(f"Scraping {len(post_urls)} post URLs with {worker_count} separate logged-in profiles.")
+
+    def scrape_one(post_url: str, worker_profile: Path) -> Post | None:
+        with tempfile.TemporaryDirectory(prefix="fb-worker-") as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            worker_output = tmp_path / "post.json"
+            worker_csv = tmp_path / "post.csv"
+            worker_debug = tmp_path / "debug"
+
+            command = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--group-url",
+                group_url,
+                "--profile-dir",
+                str(worker_profile),
+                "--output-json",
+                str(worker_output),
+                "--output-csv",
+                str(worker_csv),
+                "--max-posts",
+                "1",
+                "--max-comments",
+                str(max_comments),
+                "--max-subcomments",
+                str(max_subcomments),
+                "--comment-expand-rounds",
+                str(comment_expand_rounds),
+                "--comment-sort",
+                comment_sort,
+                "--scrolls",
+                "0",
+                "--debug-dir",
+                str(worker_debug),
+                "--extra-post-urls",
+                post_url,
+                "--parallel-workers",
+                "1",
+                "--headless" if headless else "--no-headless",
+            ]
+            result = subprocess.run(
+                command,
+                cwd=str(Path(__file__).resolve().parent),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=900,
+            )
+            for line in result.stdout.splitlines()[-20:]:
+                print(f"[worker {post_id_from_url(post_url)}] {line}")
+            if result.returncode != 0 or not worker_output.exists():
+                raise RuntimeError(f"Worker exited with code {result.returncode}")
+
+            data = json.loads(worker_output.read_text(encoding="utf-8"))
+            rows = data.get("posts") or []
+            if not rows:
+                return None
+            row = rows[0]
+            return Post(
+                id=str(row.get("id") or post_id_from_url(post_url)),
+                author=row.get("author"),
+                posted_at=row.get("posted_at"),
+                url=row.get("url") or post_url,
+                text=row.get("text") or row.get("post_text") or "",
+                raw_text=row.get("raw_text") or "",
+                text_parts=row.get("text_parts") or [],
+                reactions_text=row.get("reactions_text"),
+                comment_count_text=row.get("comment_count_text"),
+                share_count_text=row.get("share_count_text"),
+                comments=row.get("comments") or [],
+                images=row.get("images") or row.get("post_images") or [],
+            )
+
+    posts: list[Post] = []
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_to_url = {
+            executor.submit(scrape_one, post_url, usable_profiles[index % worker_count]): post_url
+            for index, post_url in enumerate(post_urls)
+        }
+        for future in as_completed(future_to_url):
+            post_url = future_to_url[future]
+            try:
+                post = future.result()
+                if post:
+                    posts.append(post)
+                    print(f"Parallel scrape finished: {post_url}")
+            except Exception as exc:
+                print(f"Parallel scrape failed for {post_url}: {exc}")
 
     return posts
 
 
 def click_comment_control_in_article(page: Page, article: Locator) -> bool:
+    try:
+        article.scroll_into_view_if_needed(timeout=1_000)
+        page.wait_for_timeout(300)
+        page.mouse.wheel(0, 900)
+        page.wait_for_timeout(500)
+    except Exception:
+        pass
+
+    try:
+        clicked = article.evaluate(
+            """
+            (root) => {
+              const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
+              const visible = (node) => {
+                const rect = node.getBoundingClientRect();
+                const style = window.getComputedStyle(node);
+                return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+              };
+              const candidates = Array.from(root.querySelectorAll('[data-ad-rendering-role="comment_button"], [aria-label], [role="button"], span, div'))
+                .filter((node) => {
+                  const label = clean(node.getAttribute("aria-label") || node.innerText || node.textContent);
+                  return /^Comment$/i.test(label) || /^Leave a comment$/i.test(label) || /^\\d+\\s+comments?$/i.test(label);
+                })
+                .filter(visible)
+                .sort((a, b) => b.getBoundingClientRect().y - a.getBoundingClientRect().y);
+              const target = candidates[0];
+              if (!target) return false;
+              target.scrollIntoView({ block: "center", inline: "center" });
+              target.click();
+              return true;
+            }
+            """
+        )
+        if clicked:
+            page.wait_for_timeout(2_000)
+            return True
+    except Exception:
+        pass
+
     selectors = [
         "[aria-label='Comment']",
         "[aria-label*='Comment']",
+        "[data-ad-rendering-role='comment_button']",
         "div[role='button']:has-text('Comment')",
         "span:has-text('Comment')",
     ]
@@ -2261,12 +3435,15 @@ def collect_posts_by_clicking_feed_comments(
     group_url: str,
     max_posts: int,
     max_comments: int,
+    max_subcomments: int,
     comment_expand_rounds: int,
     scrolls: int,
     debug_dir: str,
+    today_only: bool = True,
+    comment_sort: str = "relevant",
 ) -> list[Post]:
     posts: list[Post] = []
-    page.goto(group_url, wait_until="domcontentloaded")
+    safe_goto(page, group_url)
     page.wait_for_timeout(3_000)
     set_feed_sort_recent(page)
 
@@ -2294,6 +3471,9 @@ def collect_posts_by_clicking_feed_comments(
             visible_post = None
             visible = collect_visible_post_from_article(page, article, index, max_comments)
             if visible:
+                if today_only and is_yesterday_or_older_post(visible.posted_at):
+                    print(f"Reached older post ({visible.posted_at}); stopping today-only click scan.")
+                    return posts
                 visible_post = visible
 
             before_url = page.url
@@ -2306,15 +3486,30 @@ def collect_posts_by_clicking_feed_comments(
                     page,
                     opened_url,
                     max_comments,
+                    max_subcomments,
                     comment_expand_rounds,
                     debug_dir,
+                    comment_sort,
                 )
-                page.goto(group_url, wait_until="domcontentloaded")
+                safe_goto(page, group_url)
                 page.wait_for_timeout(2_000)
                 for _ in range(scroll + 1):
                     page.mouse.wheel(0, 2_500)
                     page.wait_for_timeout(300)
             elif clicked:
+                modal_comments = collect_comments_while_expanding(
+                    page,
+                    max_comments,
+                    comment_expand_rounds,
+                    comment_sort,
+                )
+                if visible_post and modal_comments:
+                    modal_comments = nest_subcomments(modal_comments, max_subcomments)
+                    visible_post.comments = merge_comment_lists(
+                        visible_post.comments,
+                        modal_comments,
+                        max_comments,
+                    )
                 page.keyboard.press("Escape")
                 page.wait_for_timeout(500)
 
@@ -2332,7 +3527,7 @@ def collect_visible_post_from_article(
     page: Page,
     article: Locator,
     index: int,
-    max_comments: int,
+                max_comments: int,
 ) -> Post | None:
     try:
         card = article.evaluate(FEED_CARD_SCRIPT)
@@ -2344,6 +3539,8 @@ def collect_visible_post_from_article(
     posted_at = card.get("postedAt")
     text = post_text_from_feed_parts(parts, author, posted_at)
     raw_text = card.get("rawText") or text_from(article)
+    if not posted_at:
+        posted_at = posted_at_from_text(raw_text)
     if not text and not raw_text:
         return None
 
@@ -2419,7 +3616,36 @@ def post_keys(post: Post) -> set[str]:
             keys.add(post_id_from_url(post.url))
         except Exception:
             pass
+    content_key = post_content_key(post)
+    if content_key:
+        keys.add(content_key)
     return {key for key in keys if key}
+
+
+def normalize_post_key_text(value: str | None) -> str:
+    text = re.sub(r"\s+", " ", value or "").strip().lower()
+    return text[:300]
+
+
+def first_content_image_src(post: Post) -> str:
+    images = content_images(post.images or [])
+    if not images:
+        return ""
+    return str(images[0].get("src") or "").split("?")[0]
+
+
+def post_content_key(post: Post) -> str | None:
+    text = normalize_post_key_text(post.text)
+    image_src = first_content_image_src(post)
+    author = normalize_post_key_text(post.author)
+    posted_at = normalize_post_key_text(post.posted_at)
+    if not text and not image_src:
+        return None
+    # Facebook sometimes hides permalink/time for image-background posts; use
+    # stable visible content so the same card does not appear twice.
+    if post.url:
+        return None
+    return f"content:{author}|{posted_at}|{text}|{image_src}"
 
 
 def merge_posts(
@@ -2449,10 +3675,27 @@ def merge_posts(
             target_index = min(matching_indexes)
             current = merged[target_index]
 
+            def _best_text(a: str | None, b: str | None) -> str | None:
+                """Prefer the full non-truncated version; among equals pick the longer one."""
+                a = (a or "").strip()
+                b = (b or "").strip()
+                a_truncated = "… See more" in a or "... See more" in a or a.endswith("See more")
+                b_truncated = "… See more" in b or "... See more" in b or b.endswith("See more")
+                if a_truncated and not b_truncated and b:
+                    return b
+                if b_truncated and not a_truncated and a:
+                    return a
+                return a if len(a) >= len(b) else b or None
+
             if post_quality_score(post) > post_quality_score(current):
                 # Keep useful fields from both rows.
                 if len(current.comments or []) > len(post.comments or []):
                     post.comments = current.comments
+                if current.author and (not post.author or post.url == current.url):
+                    post.author = current.author
+                if current.posted_at and post.url == current.url:
+                    post.posted_at = current.posted_at
+                post.text = _best_text(current.text, post.text) if post.url == current.url else post.text
                 post.reactions_text = better_count_text(post.reactions_text, current.reactions_text)
                 post.comment_count_text = better_count_text(post.comment_count_text, current.comment_count_text)
                 post.share_count_text = better_count_text(post.share_count_text, current.share_count_text)
@@ -2464,6 +3707,7 @@ def merge_posts(
                     current.images = post.images
                 if len(post.comments or []) > len(current.comments or []):
                     current.comments = post.comments
+                current.text = _best_text(current.text, post.text) if post.url == current.url else current.text
                 current.reactions_text = better_count_text(current.reactions_text, post.reactions_text)
                 current.comment_count_text = better_count_text(current.comment_count_text, post.comment_count_text)
                 current.share_count_text = better_count_text(current.share_count_text, post.share_count_text)
@@ -2522,18 +3766,14 @@ def extract_comments(article: Locator, max_comments: int) -> list[dict[str, str 
         if not details.get("postedAt"):
             details["postedAt"] = aria_time
 
-        text = clean_comment_text(
-            (details.get("text") or "").strip(),
-            details.get("author"),
-            details.get("postedAt"),
-        )
+        author, posted_at, text = clean_comment_payload(details)
         images = details.get("images") or []
         if len(text) < 2:
             text = comment_image_text(images)
         key = "|".join(
             [
-                details.get("author") or "",
-                details.get("postedAt") or "",
+                author or "",
+                posted_at or "",
                 text,
                 comment_image_text(images),
             ]
@@ -2546,11 +3786,13 @@ def extract_comments(article: Locator, max_comments: int) -> list[dict[str, str 
         seen.add(key)
         comments.append(
             {
-                "author": details.get("author"),
-                "posted_at": details.get("postedAt"),
+                "author": author,
+                "posted_at": posted_at,
                 "text": text,
                 "reactions": clean_comment_reaction(details.get("reactionsText")),
                 "images": images,
+                "_left": details.get("left"),
+                "_top": details.get("top"),
             }
         )
 
@@ -2596,18 +3838,14 @@ def extract_comments_from_page(page: Page, max_comments: int) -> list[dict[str, 
             if not details.get("postedAt"):
                 details["postedAt"] = aria_time
 
-            text = clean_comment_text(
-                (details.get("text") or "").strip(),
-                details.get("author"),
-                details.get("postedAt"),
-            )
+            author, posted_at, text = clean_comment_payload(details)
             images = details.get("images") or []
             if len(text) < 2:
                 text = comment_image_text(images)
             key = "|".join(
                 [
-                    details.get("author") or "",
-                    details.get("postedAt") or "",
+                    author or "",
+                    posted_at or "",
                     text,
                     comment_image_text(images),
                 ]
@@ -2620,11 +3858,13 @@ def extract_comments_from_page(page: Page, max_comments: int) -> list[dict[str, 
             seen.add(key)
             comments.append(
                 {
-                    "author": details.get("author"),
-                    "posted_at": details.get("postedAt"),
+                    "author": author,
+                    "posted_at": posted_at,
                     "text": text,
                     "reactions": clean_comment_reaction(details.get("reactionsText")),
                     "images": images,
+                    "_left": details.get("left"),
+                    "_top": details.get("top"),
                 }
             )
             if max_comments > 0 and len(comments) >= max_comments:
@@ -2697,6 +3937,42 @@ def repair_mojibake(value: object) -> object:
     return value
 
 
+def repair_mojibake(value: object) -> object:
+    if isinstance(value, str):
+        markers = (
+            chr(0x00E0),
+            chr(0x00C2),
+            chr(0x00C3),
+            chr(0x00F0),
+            chr(0x0178),
+            chr(0x02DC),
+            chr(0xFFFD),
+        )
+        if not any(marker in value for marker in markers):
+            return value
+        candidates = [value]
+        for encoding in ("cp1252", "latin1"):
+            try:
+                candidates.append(value.encode(encoding, errors="strict").decode("utf-8", errors="strict"))
+            except UnicodeError:
+                pass
+
+        def score(candidate: str) -> int:
+            thai = len(re.findall(r"[\u0E00-\u0E7F]", candidate))
+            non_bmp = sum(1 for char in candidate if ord(char) > 0xFFFF)
+            mojibake = sum(candidate.count(marker) for marker in markers)
+            replacement = candidate.count("?") + candidate.count(chr(0xFFFD))
+            return thai * 4 + non_bmp * 3 - mojibake * 8 - replacement * 2
+
+        best = max(candidates, key=score)
+        return best
+    if isinstance(value, list):
+        return [repair_mojibake(item) for item in value]
+    if isinstance(value, dict):
+        return {key: repair_mojibake(item) for key, item in value.items()}
+    return value
+
+
 def clean_comment_reaction(value: object) -> str | None:
     text = str(value or "").strip()
     if not text:
@@ -2708,16 +3984,194 @@ def clean_comment_reaction(value: object) -> str | None:
     return None
 
 
+def should_skip_image_ocr(src: str, width: int, height: int) -> bool:
+    if not src:
+        return True
+    if "images/emoji.php" in src or "/emoji/" in src:
+        return True
+    if "static.xx.fbcdn.net/rsrc.php" in src:
+        return True
+    if width and height and width < 160 and height < 120:
+        return True
+    return False
+
+
+def tesseract_path() -> str | None:
+    configured = os.getenv("TESSERACT_CMD", "").strip()
+    if configured:
+        return configured
+    return shutil.which("tesseract")
+
+
+def ocr_image_url(src: str, width: int = 0, height: int = 0) -> str | None:
+    if env_bool("IMAGE_OCR", True) is False:
+        return None
+    if should_skip_image_ocr(src, width, height):
+        return None
+
+    executable = tesseract_path()
+    if not executable:
+        return None
+
+    timeout = int(os.getenv("IMAGE_OCR_TIMEOUT", "20"))
+    lang = os.getenv("IMAGE_OCR_LANG", "eng+tha").strip() or "eng+tha"
+    request = Request(
+        src,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
+            )
+        },
+    )
+
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            image_bytes = response.read(8_000_000)
+    except Exception:
+        return None
+
+    suffix = ".jpg"
+    parsed_path = urlparse(src).path.lower()
+    if parsed_path.endswith(".png"):
+        suffix = ".png"
+    elif parsed_path.endswith(".webp"):
+        suffix = ".webp"
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
+        image_path = Path(handle.name)
+        handle.write(image_bytes)
+
+    try:
+        result = subprocess.run(
+            [executable, str(image_path), "stdout", "-l", lang, "--psm", os.getenv("IMAGE_OCR_PSM", "6")],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        if result.returncode != 0 and "tha" in lang:
+            result = subprocess.run(
+                [executable, str(image_path), "stdout", "-l", "eng", "--psm", os.getenv("IMAGE_OCR_PSM", "6")],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+    except Exception:
+        return None
+    finally:
+        try:
+            image_path.unlink()
+        except OSError:
+            pass
+
+    text = clean_post_body_text(result.stdout if result.returncode == 0 else "")
+    return text if len(text) >= 2 else None
+
+
+def enrich_images_with_ocr(images: list[dict[str, object]]) -> list[dict[str, object]]:
+    max_images = int(os.getenv("IMAGE_OCR_MAX_IMAGES_PER_POST", "2"))
+    if max_images <= 0:
+        return images
+
+    enriched: list[dict[str, object]] = []
+    ocr_count = 0
+    for image in images:
+        copied = dict(image)
+        if ocr_count < max_images and not copied.get("ocr_text"):
+            src = str(copied.get("src") or "")
+            width = int(copied.get("width") or 0)
+            height = int(copied.get("height") or 0)
+            ocr_text = ocr_image_url(src, width, height)
+            if ocr_text:
+                copied["ocr_text"] = ocr_text
+            ocr_count += 1
+        enriched.append(copied)
+    return enriched
+
+
+def content_images(images: list[dict[str, object]]) -> list[dict[str, object]]:
+    filtered: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for image in images:
+        if not isinstance(image, dict):
+            continue
+        src = str(image.get("src") or "")
+        alt = str(image.get("alt") or "")
+        width = int(image.get("width") or 0)
+        height = int(image.get("height") or 0)
+        perf_name = str(image.get("perfLogName") or "")
+        if not src:
+            continue
+        if "images/emoji.php" in src or "/emoji/" in src:
+            continue
+        if "static.xx.fbcdn.net/rsrc.php" in src:
+            continue
+        if width and height and width < 80 and height < 80:
+            continue
+        key = f"{src}|{alt}"
+        if key in seen:
+            continue
+        seen.add(key)
+        filtered.append(image)
+    return filtered
+
+
+def image_texts(images: list[dict[str, object]]) -> list[str]:
+    texts: list[str] = []
+    seen: set[str] = set()
+    for image in images:
+        if not isinstance(image, dict):
+            continue
+        candidates = [
+            re.sub(r"\s+", " ", str(image.get("alt") or "")).strip(),
+            re.sub(r"\s+", " ", str(image.get("ocr_text") or "")).strip(),
+        ]
+        for candidate in candidates:
+            if not candidate:
+                continue
+            if candidate in {"Image", "May be an image", "No photo description available."}:
+                continue
+            candidate = clean_post_body_text(candidate)
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            texts.append(candidate)
+    return texts
+
+
+def combined_analysis_text(post_text: str | None, images: list[dict[str, object]]) -> str:
+    parts = []
+    if post_text:
+        parts.append(clean_post_body_text(post_text))
+    parts.extend(image_texts(images))
+    cleaned_parts = []
+    seen: set[str] = set()
+    for part in parts:
+        text = re.sub(r"\s+", " ", str(part or "")).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        cleaned_parts.append(text)
+    return "\n".join(cleaned_parts)
+
+
 def serialize_post(post: Post) -> dict:
     data = post.__dict__.copy()
-    comments = post.comments or []
-    images = post.images or []
+    comments = [strip_comment_internals(comment) for comment in (post.comments or []) if isinstance(comment, dict)]
+    data["comments"] = comments
+    images = enrich_images_with_ocr(content_images(post.images or []))
+    post_text = clean_post_body_text(post.text)
     reaction_count = parse_count_text(post.reactions_text)
     total_comment_count = parse_count_text(post.comment_count_text)
     share_count = parse_count_text(post.share_count_text)
-    data["content_type"] = "text_image" if post.text and images else "image" if images else "text" if post.text else "unknown"
-    data["post_text"] = post.text
+    data["text"] = post_text
+    data["content_type"] = "text_image" if post_text and images else "image" if images else "text" if post_text else "unknown"
+    data["post_text"] = post_text
     data["post_images"] = images
+    data["image_texts"] = image_texts(images)
+    data["analysis_text"] = combined_analysis_text(post_text, images)
     data["reaction_count"] = reaction_count if reaction_count is not None else 0
     data["total_comment_count"] = total_comment_count if total_comment_count is not None else len(comments)
     data["share_count"] = share_count if share_count is not None else 0
@@ -2886,6 +4340,8 @@ def main() -> None:
     group_id = group_id_from_url(group_url)
     profile_dir = Path(args.profile_dir).resolve()
     profile_dir.mkdir(parents=True, exist_ok=True)
+    parallel_profile_dirs = parse_profile_dirs(args.parallel_profile_dirs, Path.cwd())
+    warn_if_profile_locked(profile_dir)
 
     with sync_playwright() as playwright:
         context = playwright.chromium.launch_persistent_context(
@@ -2895,15 +4351,17 @@ def main() -> None:
             locale="en-US",
         )
         page = context.pages[0] if context.pages else context.new_page()
+        page.set_default_timeout(15_000)
+        page.set_default_navigation_timeout(45_000)
 
-        page.goto(FACEBOOK_HOME, wait_until="domcontentloaded")
+        safe_goto(page, FACEBOOK_HOME)
         if is_login_or_checkpoint(page):
             prefill_login_email(page, args.facebook_email)
             input("Finish Facebook login/security checks in the browser, then press Enter...")
 
         print(f"Opening group: {group_url}")
-        page.goto(group_url, wait_until="domcontentloaded")
-        page.wait_for_timeout(4_000)
+        safe_goto(page, group_url)
+        page.wait_for_timeout(2_000)
         set_feed_sort_recent(page)
         metadata = get_group_metadata(page, group_url)
         if metadata.member_count_text:
@@ -2915,29 +4373,161 @@ def main() -> None:
         extra_post_urls = parse_extra_post_urls(args.extra_post_urls, group_id)
         if extra_post_urls:
             print(f"Adding {len(extra_post_urls)} extra post URLs from EXTRA_POST_URLS.")
-        for post_url in extra_post_urls:
-            if len(posts) >= args.max_posts:
-                break
-            post = scrape_post_page(
+            explicit_posts = scrape_post_urls(
+                context,
                 page,
-                post_url,
+                extra_post_urls[: args.max_posts],
                 args.max_comments,
+                args.max_subcomments,
                 args.comment_expand_rounds,
                 args.debug_dir,
+                args.parallel_workers,
+                profile_dir,
+                parallel_profile_dirs,
+                group_url,
+                args.headless,
+                args.comment_sort,
             )
-            if post:
+            for post in explicit_posts:
+                if len(posts) >= args.max_posts:
+                    break
                 posts = merge_posts(posts, [post], args.max_posts, replace_when_full=False)
                 print(f"Collected/merged explicit post URL {len(posts)} total rows")
 
-        if len(posts) < args.max_posts:
+        parallel_group_mode = args.parallel_workers > 1 and bool(parallel_profile_dirs) and len(posts) < args.max_posts
+        if parallel_group_mode:
+            print(
+                "Parallel group mode enabled: reading visible New posts first, "
+                "then scraping matching post/comment pages across separate logged-in profiles."
+            )
+            explicit_keys = set().union(*(post_keys(post) for post in posts)) if posts else set()
+
+            seed_posts = collect_visible_feed_posts_over_scrolls(
+                page,
+                group_url,
+                args.max_posts,
+                1,
+                max(3, args.scrolls // 3),
+                args.today_only,
+                args.recover_urls,
+            )
+            if seed_posts:
+                posts = merge_posts(posts, seed_posts, args.max_posts, replace_when_full=False)
+
+            needs_feed_comment_click = any(
+                (not post.url or parse_count_text(post.comment_count_text)) and not post.comments
+                for post in seed_posts
+            ) and args.comment_expand_rounds > 0
+            if needs_feed_comment_click:
+                click_posts = collect_posts_by_clicking_feed_comments(
+                    page,
+                    group_url,
+                    args.max_posts,
+                    args.max_comments,
+                    args.max_subcomments,
+                    args.comment_expand_rounds,
+                    max(3, args.scrolls // 3),
+                    args.debug_dir,
+                    args.today_only,
+                    args.comment_sort,
+                )
+                posts = merge_posts(posts, click_posts, args.max_posts, replace_when_full=False)
+
+            seed_urls = [post.url for post in seed_posts if post.url]
+            if not args.today_only and len(posts) < args.max_posts and len(seed_urls) < args.max_posts:
+                discovered_urls = collect_post_urls_from_group_surfaces(
+                    page,
+                    group_url,
+                    group_id,
+                    args.max_posts - len(seed_urls),
+                    args.scrolls,
+                )
+                seed_urls = merge_urls(seed_urls, discovered_urls)
+
+            missing_urls = []
+            for post_url in seed_urls:
+                if len(missing_urls) >= args.max_posts:
+                    break
+                if post_url in explicit_keys or post_id_from_url(post_url) in explicit_keys:
+                    continue
+                missing_urls.append(post_url)
+
+            url_posts = scrape_post_urls(
+                context,
+                page,
+                missing_urls[: args.max_posts],
+                args.max_comments,
+                args.max_subcomments,
+                args.comment_expand_rounds,
+                args.debug_dir,
+                args.parallel_workers,
+                profile_dir,
+                parallel_profile_dirs,
+                group_url,
+                args.headless,
+                args.comment_sort,
+            )
+            for post in url_posts:
+                posts = merge_posts(posts, [post], args.max_posts)
+                print(f"Collected/merged parallel post URL {len(posts)} total rows")
+            if len(posts) < args.max_posts and seed_posts:
+                posts = merge_posts(posts, seed_posts, args.max_posts, replace_when_full=False)
+
+        if args.today_only and not parallel_group_mode and len(posts) < args.max_posts:
+            feed_posts = collect_visible_feed_posts_over_scrolls(
+                page,
+                group_url,
+                args.max_posts,
+                args.max_comments,
+                max(3, args.scrolls // 3),
+                args.today_only,
+                args.recover_urls,
+            )
+            posts = merge_posts(posts, feed_posts, args.max_posts, replace_when_full=False)
+            if args.max_comments > 0 and args.comment_expand_rounds > 0:
+                comment_urls = [
+                    post.url
+                    for post in posts
+                    if post.url
+                    and len(post.comments or []) < min(
+                        args.max_comments,
+                        parse_count_text(post.comment_count_text) or args.max_comments,
+                    )
+                ]
+                if comment_urls:
+                    print(
+                        f"Fetching up to {args.max_comments} {args.comment_sort} comments "
+                        f"for {len(comment_urls)} feed post URLs."
+                    )
+                    comment_posts = scrape_post_urls(
+                        context,
+                        page,
+                        comment_urls,
+                        args.max_comments,
+                        args.max_subcomments,
+                        args.comment_expand_rounds,
+                        args.debug_dir,
+                        1,
+                        profile_dir,
+                        parallel_profile_dirs,
+                        group_url,
+                        args.headless,
+                        args.comment_sort,
+                    )
+                    posts = merge_posts(posts, comment_posts, args.max_posts, replace_when_full=False)
+
+        if not args.today_only and not parallel_group_mode and len(posts) < args.max_posts:
             click_posts = collect_posts_by_clicking_feed_comments(
                 page,
                 group_url,
                 args.max_posts,
                 args.max_comments,
+                args.max_subcomments,
                 args.comment_expand_rounds,
                 args.scrolls,
                 args.debug_dir,
+                args.today_only,
+                args.comment_sort,
             )
             print(f"Comment-click scan collected {len(click_posts)} rows.")
 
@@ -2947,10 +4537,12 @@ def main() -> None:
                 args.max_posts,
                 args.max_comments,
                 max(3, args.scrolls // 3),
+                args.today_only,
+                args.recover_urls,
             )
             posts = merge_posts(posts, merge_posts(click_posts, feed_posts, args.max_posts), args.max_posts, replace_when_full=False)
 
-        if len(posts) < args.max_posts:
+        if not args.today_only and not parallel_group_mode and len(posts) < args.max_posts:
             post_urls = collect_post_urls_from_group_surfaces(
                 page,
                 group_url,
@@ -2960,37 +4552,56 @@ def main() -> None:
             )
             post_urls = merge_urls(extra_post_urls, post_urls)
             known_keys = set().union(*(post_keys(post) for post in posts)) if posts else set()
+            missing_urls = []
             for post_url in post_urls:
-                if len(posts) >= args.max_posts:
+                if len(posts) + len(missing_urls) >= args.max_posts:
                     break
                 if post_url in known_keys or post_id_from_url(post_url) in known_keys:
                     continue
-                post = scrape_post_page(
-                    page,
-                    post_url,
-                    args.max_comments,
-                    args.comment_expand_rounds,
-                    args.debug_dir,
-                )
+                missing_urls.append(post_url)
+
+            url_posts = scrape_post_urls(
+                context,
+                page,
+                missing_urls,
+                args.max_comments,
+                args.max_subcomments,
+                args.comment_expand_rounds,
+                args.debug_dir,
+                args.parallel_workers,
+                profile_dir,
+                parallel_profile_dirs,
+                group_url,
+                args.headless,
+                args.comment_sort,
+            )
+            for post in url_posts:
+                if len(posts) >= args.max_posts:
+                    break
                 if post:
                     posts = merge_posts(posts, [post], args.max_posts, replace_when_full=False)
                     known_keys.update(post_keys(post))
                     print(f"Collected/merged post URL {len(posts)} total rows")
 
-        if not posts:
+        if not posts and not args.today_only:
             print("No post permalink data found. Falling back to visible feed extraction.")
-            page.goto(group_url, wait_until="domcontentloaded")
+            safe_goto(page, group_url)
             page.wait_for_timeout(3_000)
             for scroll in range(args.scrolls):
                 expand_visible_content(page)
-                posts = collect_posts(
+                scroll_posts = collect_posts(
                     page,
                     args.max_posts,
                     args.max_comments,
                     args.comment_expand_rounds,
+                    args.today_only,
                 )
+                posts = merge_posts(posts, scroll_posts, args.max_posts, replace_when_full=False)
                 print(f"Scroll {scroll + 1}/{args.scrolls}: collected {len(posts)} posts")
                 if len(posts) >= args.max_posts:
+                    break
+                if args.today_only and posts and scroll >= 2:
+                    print("Today-only fallback scan stopped after stable visible post collection.")
                     break
 
                 page.mouse.wheel(0, 2_500)

@@ -28,20 +28,42 @@ class ScrapeRequest(BaseModel):
     group_url: str | None = Field(default=None, description="Facebook group URL.")
     profile_dir: str = Field(default="browser-profile")
     facebook_email: str | None = None
-    max_posts: int = Field(default=25, ge=1, le=500)
+    max_posts: int = Field(default=25, ge=1, le=2000)
     max_comments: int | None = Field(
-        default=1000,
+        default=20,
         ge=0,
         description="Maximum comments/replies per post. Use 0 or null for no scraper-side limit.",
     )
     comment_expand_rounds: int | None = Field(
-        default=6,
+        default=1,
         ge=0,
-        description="Comment/reply expansion rounds. Use 0 or null to expand until no more controls are found.",
+        description="Comment/reply expansion rounds. Use 0 for no expansion beyond currently visible comments.",
+    )
+    comment_sort: Literal["relevant", "all"] = Field(
+        default="relevant",
+        description="Use Facebook's relevant comments for speed, or all comments for exhaustive scraping.",
     )
     scrolls: int = Field(default=12, ge=0, le=200)
     headless: bool = False
     extra_post_urls: str | None = None
+    parallel_workers: int = Field(
+        default=1,
+        ge=1,
+        le=8,
+        description="Parallel workers for scraping post permalink pages. Requires separate logged-in profiles.",
+    )
+    parallel_profile_dirs: str | None = Field(
+        default=None,
+        description="Comma/newline-separated browser profile directories. Each must already be logged into Facebook.",
+    )
+    today_only: bool = Field(
+        default=True,
+        description="Stop scanning New posts once a Yesterday/older post is reached.",
+    )
+    recover_urls: bool = Field(
+        default=False,
+        description="Enable slower click/HTML recovery for feed posts that do not expose permalinks.",
+    )
 
 
 class JobCreated(BaseModel):
@@ -97,10 +119,16 @@ def run_scrape_job(job_id: str, request: ScrapeRequest) -> None:
         str(request.max_comments or 0),
         "--comment-expand-rounds",
         str(request.comment_expand_rounds or 0),
+        "--comment-sort",
+        request.comment_sort,
         "--scrolls",
         str(request.scrolls),
         "--debug-dir",
         str(debug_dir),
+        "--parallel-workers",
+        str(request.parallel_workers),
+        "--today-only" if request.today_only else "--no-today-only",
+        "--recover-urls" if request.recover_urls else "--no-recover-urls",
         "--headless" if request.headless else "--no-headless",
     ]
 
@@ -110,6 +138,8 @@ def run_scrape_job(job_id: str, request: ScrapeRequest) -> None:
         command.extend(["--facebook-email", request.facebook_email])
     if request.extra_post_urls:
         command.extend(["--extra-post-urls", request.extra_post_urls])
+    if request.parallel_profile_dirs:
+        command.extend(["--parallel-profile-dirs", request.parallel_profile_dirs])
 
     with jobs_lock:
         jobs[job_id]["status"] = "running"
